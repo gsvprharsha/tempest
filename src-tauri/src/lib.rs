@@ -1,8 +1,8 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::Mutex;
-use tauri::Emitter;
+use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
+use tauri::ipc::Channel;
 
 #[tauri::command]
 fn create_workspace(location: String, name: String) -> Result<String, String> {
@@ -117,6 +117,31 @@ const FILES_TO_COPY: &[&str] = &[".env", ".env.local", ".env.development", ".env
 // Unix) rather than copied. Copying these recursively can be 200–800 MB and tens
 // of thousands of files, which froze the worker thread; a link is instantaneous.
 const DIRS_TO_LINK: &[&str] = &["node_modules", ".venv"];
+
+// Remove the junction (Windows) or symlink (Unix) entries for every DIRS_TO_LINK
+// member inside a worktree BEFORE deleting the worktree itself.
+//
+// Without this, `fs::remove_dir_all` and `git worktree remove --force` follow
+// the junction into the real node_modules and either freeze (deleting 100k+ files
+// from the project) or corrupt it by removing the original.
+//
+// On Windows `std::fs::remove_dir` calls `RemoveDirectory`, which strips the
+// reparse point atomically without traversing or touching the target directory.
+// On Unix `std::fs::remove_file` removes the symlink without following it.
+// In both cases a real (non-linked) directory is left untouched so `remove_dir_all`
+// can handle it afterward.
+fn remove_dir_links(worktree_path: &std::path::Path) {
+    for dir_name in DIRS_TO_LINK {
+        let link = worktree_path.join(dir_name);
+        // exists() follows the reparse point — true when the junction/target is present.
+        if link.exists() {
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&link);
+            #[cfg(not(windows))]
+            let _ = std::fs::remove_file(&link);
+        }
+    }
+}
 
 fn copy_file_or_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     if src.is_dir() {
@@ -429,6 +454,9 @@ fn git_worktree_remove(repo_path: String, worktree_path: String) -> Result<(), S
     #[cfg(windows)]
     let worktree_path = worktree_path.replace('/', "\\");
 
+    // Remove junctions / symlinks first — same reason as in close_and_remove_worktree.
+    remove_dir_links(std::path::Path::new(&worktree_path));
+
     // Try git's own removal first (handles deregistration + directory delete).
     let out = new_command("git")
         .args(["-C", &repo_path, "worktree", "remove", "--force", &worktree_path])
@@ -677,10 +705,10 @@ struct PtyOutputPayload {
 }
 
 struct PtySession {
-    writer: Box<dyn Write + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    _slave: Box<dyn portable_pty::SlavePty + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
+    _slave: Mutex<Box<dyn portable_pty::SlavePty + Send>>,
+    child:  Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
     /// Working directory (worktree path) this session was spawned in. Used to
     /// locate the `.tempest-pid` sidecar file on close so it can be cleaned up.
     cwd: String,
@@ -726,9 +754,9 @@ fn kill_persisted_pid(worktree_path: &str) {
     }
 }
 
-pub struct PtyState(pub(crate) Mutex<HashMap<String, PtySession>>);
+pub struct PtyState(pub(crate) Arc<DashMap<String, Arc<PtySession>>>);
 
-pub struct ZenState(pub Mutex<HashMap<String, (String, String)>>);
+pub struct ZenState(pub Mutex<std::collections::HashMap<String, (String, String)>>);
 
 #[tauri::command]
 fn open_zen_window(
@@ -801,8 +829,8 @@ async fn create_pty_session(
     cols: u16,
     command: Option<String>,
     args: Option<Vec<String>>,
+    on_event: Channel<PtyOutputPayload>,
     state: tauri::State<'_, PtyState>,
-    app: tauri::AppHandle,
 ) -> Result<(), String> {
     // Resolve (and cache) the shell once. Cheap if already populated; the first
     // call performs the ~100–200ms probe so no individual session pays for it twice.
@@ -882,10 +910,10 @@ async fn create_pty_session(
 
         Ok::<_, String>((
             PtySession {
-                writer,
-                master: pair.master,
-                _slave: pair.slave,
-                child,
+                writer: Mutex::new(writer),
+                master: Mutex::new(pair.master),
+                _slave: Mutex::new(pair.slave),
+                child:  Mutex::new(child),
                 cwd,
             },
             reader,
@@ -894,8 +922,10 @@ async fn create_pty_session(
     .await
     .map_err(|e| e.to_string())??;
 
-    // Pump PTY output to the frontend on a background thread.
+    // Pump PTY output to the frontend on a background thread, directly through
+    // this session's dedicated channel — O(1), no broadcast, no filtering.
     let sid = session_id.clone();
+    let on_event_clone = on_event.clone();
     let mut reader = reader;
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -904,20 +934,16 @@ async fn create_pty_session(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    app.emit(
-                        "pty-output",
-                        PtyOutputPayload {
-                            session_id: sid.clone(),
-                            data,
-                        },
-                    )
-                    .ok();
+                    on_event_clone.send(PtyOutputPayload {
+                        session_id: sid.clone(),
+                        data,
+                    }).ok();
                 }
             }
         }
     });
 
-    state.0.lock().unwrap().insert(session_id, session);
+    state.0.insert(session_id, Arc::new(session));
 
     Ok(())
 }
@@ -928,9 +954,9 @@ fn write_to_pty(
     data: Vec<u8>,
     state: tauri::State<PtyState>,
 ) -> Result<(), String> {
-    let mut sessions = state.0.lock().unwrap();
-    if let Some(session) = sessions.get_mut(&session_id) {
-        session.writer.write_all(&data).map_err(|e| e.to_string())?;
+    let session_arc = state.0.get(&session_id).map(|r| Arc::clone(&*r));
+    if let Some(session) = session_arc {
+        session.writer.lock().unwrap().write_all(&data).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -942,16 +968,10 @@ fn resize_pty(
     cols: u16,
     state: tauri::State<PtyState>,
 ) -> Result<(), String> {
-    let sessions = state.0.lock().unwrap();
-    if let Some(session) = sessions.get(&session_id) {
-        session
-            .master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+    let session_arc = state.0.get(&session_id).map(|r| Arc::clone(&*r));
+    if let Some(session) = session_arc {
+        session.master.lock().unwrap()
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -962,41 +982,26 @@ fn close_pty_session(
     session_id: String,
     state: tauri::State<PtyState>,
 ) -> Result<(), String> {
-    // Pull the session out of the map first so the lock is released quickly.
-    let session = state.0.lock().unwrap().remove(&session_id);
+    // Atomically remove the session from the map and operate through its Arc.
+    let removed = state.0.remove(&session_id).map(|(_, arc)| arc);
+    if let Some(session) = removed {
+        // Kill the child process. On Windows portable-pty kills the whole job
+        // object (the shell *and* its descendants — e.g. the agent CLI), which
+        // is exactly what holds the CWD lock.
+        let _ = session.child.lock().unwrap().kill();
 
-    if let Some(mut session) = session {
-        // 1. Drop the writer so the slave side sees EOF on stdin. This nudges
-        //    a cooperative shell (PowerShell / $SHELL) to exit on its own.
-        drop(session.writer);
-
-        // 2. Explicitly kill the child process. On Windows portable-pty kills
-        //    the whole job object (the shell *and* its descendants — e.g. the
-        //    agent CLI), which is exactly what holds the CWD lock.
-        let _ = session.child.kill();
-
-        // 3. Block until the process has actually exited. Without this the
-        //    command returns while the OS is still tearing the process down,
-        //    and the worktree directory stays locked (os error 32). We wait in
-        //    a short bounded loop so a wedged process can't hang the UI.
+        // Wait for exit (bounded loop) — without this the command returns while
+        // the OS is still tearing the process down, leaving the worktree dir
+        // locked (os error 32).
         for _ in 0..40u32 {
-            match session.child.try_wait() {
-                Ok(Some(_)) => break,        // exited
-                Ok(None) => {                // still alive — give it a moment
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(_) => break,             // can't query — stop waiting
+            match session.child.lock().unwrap().try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(_) => break,
             }
         }
 
-        // 4. Drop the master PTY last so its handles are released after the
-        //    child is gone (dropping it earlier can leave the child holding
-        //    an inherited handle to the CWD).
-        drop(session.master);
-
-        // 5. Remove the persisted PID sidecar — the process is gone, so the
-        //    file is stale. Metadata only: we never touch the worktree itself
-        //    here (deletion is an explicit, user-consented action elsewhere).
+        // Remove PID sidecar
         let _ = std::fs::remove_file(pid_file_path(&session.cwd));
     }
 
@@ -1018,28 +1023,22 @@ fn close_and_remove_worktree(
     // 1-4. Kill the PTY child and wait for it to fully exit, then drop handles.
     //      If the session isn't in the map (already closed), skip straight to
     //      directory removal.
-    let session = state.0.lock().unwrap().remove(&session_id);
-    if let Some(mut session) = session {
-        // Drop the writer so the slave side sees EOF on stdin.
-        drop(session.writer);
-
+    let removed = state.0.remove(&session_id).map(|(_, arc)| arc);
+    if let Some(session) = removed {
         // Kill the child. On Windows portable-pty kills the whole job object
         // (shell + descendants such as the agent CLI) — exactly what holds the
         // CWD lock on the worktree directory.
-        let _ = session.child.kill();
+        let _ = session.child.lock().unwrap().kill();
 
         // Block until the process has actually exited (up to ~3s). Without this
         // the directory removal below races a process that's still tearing down.
         for _ in 0..60u32 {
-            match session.child.try_wait() {
+            match session.child.lock().unwrap().try_wait() {
                 Ok(Some(_)) => break, // exited
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
                 Err(_) => break, // can't query — stop waiting
             }
         }
-
-        // Drop the master PTY last so its handles release after the child is gone.
-        drop(session.master);
     }
 
     // 5. Belt-and-suspenders: read the persisted PID sidecar and force-kill that
@@ -1055,6 +1054,12 @@ fn close_and_remove_worktree(
     // 6. Remove the worktree directory.
     #[cfg(windows)]
     let worktree_path = worktree_path.replace('/', "\\");
+
+    // Remove any directory junctions / symlinks we created for DIRS_TO_LINK
+    // (node_modules, .venv) BEFORE attempting any directory deletion.
+    // git worktree remove and remove_dir_all both follow Windows junctions,
+    // which would traverse into — and destroy — the real node_modules.
+    remove_dir_links(std::path::Path::new(&worktree_path));
 
     // Try git's own removal first (handles deregistration + directory delete).
     let out = new_command("git")
@@ -1262,8 +1267,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(PtyState(Mutex::new(HashMap::new())))
-        .manage(ZenState(Mutex::new(HashMap::new())))
+        .manage(PtyState(Arc::new(DashMap::new())))
+        .manage(ZenState(Mutex::new(std::collections::HashMap::new())))
         .setup(|app| {
             use tauri::Manager;
             if let Some(window) = app.get_webview_window("main") {

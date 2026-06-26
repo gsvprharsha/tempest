@@ -9,7 +9,8 @@ export type ActionId =
   | "newWorkspace"
   | "closeTab"
   | "nextTab"
-  | "prevTab";
+  | "prevTab"
+  | "broadcast";
 
 export interface Shortcut {
   key: string;   // KeyboardEvent.key (original casing preserved)
@@ -34,6 +35,7 @@ export const ACTION_DEFS: ActionDef[] = [
   { id: "closeTab",           label: "Close Tab",              group: "Workspaces"  },
   { id: "nextTab",            label: "Next Tab",               group: "Navigation"  },
   { id: "prevTab",            label: "Previous Tab",           group: "Navigation"  },
+  { id: "broadcast",          label: "Broadcast to Agents",    group: "Workspaces"  },
 ];
 
 export const DEFAULTS: Record<ActionId, Shortcut | null> = {
@@ -46,6 +48,7 @@ export const DEFAULTS: Record<ActionId, Shortcut | null> = {
   closeTab:           { key: "w",   ctrl: true,  shift: false, alt: false },
   nextTab:            { key: "Tab", ctrl: true,  shift: false, alt: false },
   prevTab:            { key: "Tab", ctrl: true,  shift: true,  alt: false },
+  broadcast:          { key: "b",   ctrl: true,  shift: true,  alt: false },
 };
 
 const STORAGE_KEY = "tempest-keybindings";

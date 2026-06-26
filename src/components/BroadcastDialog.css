@@ -1,0 +1,225 @@
+.bc-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+}
+
+.bc-dialog {
+  background: var(--tempest-bg-active);
+  border: 1px solid var(--tempest-border-subtle);
+  border-radius: 8px;
+  width: 420px;
+  max-width: calc(100vw - 48px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+}
+
+/* ── Header ── */
+.bc-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--tempest-border-subtle);
+}
+
+.bc-header-icon {
+  color: var(--tempest-accent-blue);
+  flex-shrink: 0;
+}
+
+.bc-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tempest-text-primary);
+  flex: 1;
+}
+
+.bc-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--tempest-text-muted);
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  border-radius: 3px;
+  transition: color 120ms, background 120ms;
+}
+.bc-close:hover {
+  color: var(--tempest-text-primary);
+  background: var(--tempest-bg-hover);
+}
+
+/* ── Empty state ── */
+.bc-empty {
+  font-size: 12px;
+  color: var(--tempest-text-muted);
+  text-align: center;
+  padding: 24px 16px;
+  margin: 0;
+}
+
+/* ── Session list ── */
+.bc-session-list {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 0 4px;
+  border-bottom: 1px solid var(--tempest-border-subtle);
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tempest-border-subtle) transparent;
+}
+
+.bc-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 100ms;
+}
+.bc-session-row:hover {
+  background: var(--tempest-bg-hover);
+}
+
+.bc-session-row--all {
+  border-bottom: 1px solid var(--tempest-border-subtle);
+  margin-bottom: 2px;
+  padding-bottom: 7px;
+}
+
+.bc-checkbox {
+  accent-color: var(--tempest-accent-blue);
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.bc-all-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--tempest-text-secondary);
+  flex: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.bc-count {
+  font-size: 11px;
+  color: var(--tempest-text-muted);
+  background: var(--tempest-bg-editor);
+  border: 1px solid var(--tempest-border-subtle);
+  border-radius: 10px;
+  padding: 0 6px;
+  min-width: 20px;
+  text-align: center;
+}
+
+.bc-session-name {
+  font-size: 12px;
+  color: var(--tempest-text-primary);
+  font-family: "Geist Mono", monospace;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bc-session-project {
+  font-size: 11px;
+  color: var(--tempest-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100px;
+}
+
+/* ── Compose area ── */
+.bc-compose {
+  padding: 12px 14px 6px;
+}
+
+.bc-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--tempest-bg-editor);
+  border: 1px solid var(--tempest-border-subtle);
+  border-radius: 5px;
+  color: var(--tempest-text-primary);
+  font-size: 12.5px;
+  font-family: inherit;
+  padding: 8px 10px;
+  resize: vertical;
+  outline: none;
+  transition: border-color 120ms;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tempest-border-subtle) transparent;
+}
+.bc-textarea:focus {
+  border-color: var(--tempest-accent-blue);
+}
+.bc-textarea::placeholder {
+  color: var(--tempest-text-muted);
+}
+
+.bc-hint {
+  font-size: 10.5px;
+  color: var(--tempest-text-muted);
+  margin: 5px 0 0;
+  text-align: right;
+}
+
+/* ── Actions ── */
+.bc-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 14px 12px;
+}
+
+.bc-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 5px 12px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, opacity 120ms;
+}
+
+.bc-btn--cancel {
+  background: transparent;
+  border-color: var(--tempest-border-subtle);
+  color: var(--tempest-text-secondary);
+}
+.bc-btn--cancel:hover {
+  background: var(--tempest-bg-hover);
+  color: var(--tempest-text-primary);
+}
+
+.bc-btn--send {
+  background: var(--tempest-accent-blue);
+  color: #fff;
+  border-color: transparent;
+}
+.bc-btn--send:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.bc-btn--send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

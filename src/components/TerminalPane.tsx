@@ -1,16 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { SearchAddon } from "@xterm/addon-search";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTheme } from "../themes/ThemeContext";
-import { setWorkState, getWorkState } from "../store/workState";
 import { getSettings, useSettings } from "../store/appSettings";
+import { sessionManager } from "../store/sessionManager";
+import { webglPool } from "../lib/webglPool";
 import "@xterm/xterm/css/xterm.css";
 import "./TerminalPane.css";
 
@@ -18,15 +17,7 @@ interface Props {
   sessionId: string;
   hidden?: boolean;
   isAgent?: boolean;
-  onAgentDone?: () => void;
-  onOutputChunk?: (data: string) => void;
 }
-
-// Idle period (ms) with no PTY output before an active agent is considered "done".
-const QUIET_MS = 4000;
-// Window (ms) after the user presses Enter during which "done" signals are ignored,
-// so the shell/agent echo of the just-sent line can't immediately trip the timer.
-const DEAD_ZONE_MS = 300;
 
 function getTerminalTheme() {
   const s = getComputedStyle(document.documentElement);
@@ -56,43 +47,31 @@ function getTerminalTheme() {
   };
 }
 
-export function TerminalPane({ sessionId, hidden = false, isAgent = false, onAgentDone, onOutputChunk }: Props) {
+export const TerminalPane = memo(function TerminalPane({ sessionId, hidden = false, isAgent = false }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
-  const onAgentDoneRef = useRef(onAgentDone);
-  onAgentDoneRef.current = onAgentDone;
-  const onOutputChunkRef = useRef(onOutputChunk);
-  onOutputChunkRef.current = onOutputChunk;
+  // Stable reference to the data callback so attach/detach always use the same function identity.
+  const onDataRef = useRef<(data: string) => void>(() => {});
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const { theme } = useTheme();
   const settings = useSettings();
 
-  // Keep the latest isAgent flag readable from inside the (stable) event handlers
-  // without re-creating the terminal when the prop changes.
-  const isAgentRef = useRef(isAgent);
-  isAgentRef.current = isAgent;
+  const fitIfVisible = () => {
+    const c = containerRef.current;
+    if (!c || c.offsetWidth === 0 || c.offsetHeight === 0) return;
+    fitAddonRef.current?.fit();
+  };
 
-  // Refit when this tab is revealed. Double rAF gives the browser two frames to
-  // finish flex layout before xterm measures the container.
+  // Hot-swap theme on existing terminal without touching the PTY session.
   useEffect(() => {
-    if (!hidden && fitAddonRef.current) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => fitAddonRef.current?.fit());
-      });
-    }
-  }, [hidden]);
-
-  // Hot-swap theme on existing terminal without touching the PTY session
-  useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.theme = getTerminalTheme();
-    }
+    if (termRef.current) termRef.current.options.theme = getTerminalTheme();
   }, [theme]);
 
-  // Hot-swap terminal display settings without recreating the session
+  // Hot-swap terminal display settings without recreating the session.
   useEffect(() => {
     const t = termRef.current;
     if (!t) return;
@@ -101,10 +80,11 @@ export function TerminalPane({ sessionId, hidden = false, isAgent = false, onAge
     t.options.cursorStyle = settings.terminalCursorStyle;
     t.options.cursorBlink = settings.terminalCursorBlink;
     t.options.scrollback = settings.terminalScrollback;
-    requestAnimationFrame(() => fitAddonRef.current?.fit());
+    requestAnimationFrame(fitIfVisible);
   }, [settings.terminalFontSize, settings.terminalFontFamily, settings.terminalCursorStyle, settings.terminalCursorBlink, settings.terminalScrollback]);
 
-  // Create terminal once per sessionId
+  // Create terminal once per sessionId. Work-done detection, buffering, and channel
+  // ownership all live in the SessionManager — TerminalPane is a thin renderer.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -121,126 +101,56 @@ export function TerminalPane({ sessionId, hidden = false, isAgent = false, onAge
     });
     termRef.current = term;
 
-    // fit
     const fitAddon = new FitAddon();
     fitAddonRef.current = fitAddon;
     term.loadAddon(fitAddon);
 
-    // unicode11 — correct CJK/emoji glyph widths; must be activated after load
     const unicode11 = new Unicode11Addon();
     term.loadAddon(unicode11);
     term.unicode.activeVersion = "11";
 
-    // search
     const searchAddon = new SearchAddon();
     searchAddonRef.current = searchAddon;
     term.loadAddon(searchAddon);
 
-    // web-links — Ctrl/Cmd+click to open URLs in the system browser
-    term.loadAddon(
-      new WebLinksAddon((_, url) => {
-        openUrl(url).catch(() => {});
-      })
-    );
+    term.loadAddon(new WebLinksAddon((_, url) => openUrl(url).catch(() => {})));
 
     term.open(el);
 
-    // WebGL renderer — try GPU path, fall back to canvas silently
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
-      term.loadAddon(webgl);
-    } catch {
-      // software rasterizer or WebGL unavailable — canvas renderer used automatically
-    }
+    // Register as a renderer with the Session Manager and replay any buffered output.
+    // The Manager owns the Channel and runs work-done detection independently.
+    const onData = (data: string) => term.write(data);
+    onDataRef.current = onData;
+    const buffered = sessionManager.attach(sessionId, onData);
+    for (const chunk of buffered) term.write(chunk);
 
-    // Two rAFs: first lets the browser compute flex layout after mount, second
-    // fires after the layout pass so xterm reads the correct container dimensions.
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        fitAddon.fit();
-        invoke("resize_pty", { sessionId, rows: term.rows, cols: term.cols }).catch(() => {});
-      });
-    });
-
-    // ── Work-done detection (agent sessions only) ──────────────────────────
-    let quietTimer: ReturnType<typeof setTimeout> | null = null;
-    let deadZoneUntil = 0; // timestamp; "done" signals before this are suppressed
-
-    const clearQuietTimer = () => {
-      if (quietTimer !== null) {
-        clearTimeout(quietTimer);
-        quietTimer = null;
-      }
+    const fitAndResize = () => {
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) return;
+      fitAddon.fit();
+      invoke("resize_pty", { sessionId, rows: term.rows, cols: term.cols }).catch(() => {});
     };
 
-    // Mark the agent done unless we're still inside the post-Enter dead zone or
-    // it isn't actually working. Resets any pending quiet timer.
-    const markDone = () => {
-      clearQuietTimer();
-      if (Date.now() < deadZoneUntil) return;
-      if (getWorkState(sessionId) === "working") {
-        setWorkState(sessionId, "done");
-        onAgentDoneRef.current?.();
-      }
-    };
-
-    const scheduleQuiet = () => {
-      clearQuietTimer();
-      quietTimer = setTimeout(markDone, QUIET_MS);
-    };
-
-    const unlistenPromise = listen<{ session_id: string; data: string }>(
-      "pty-output",
-      (event) => {
-        if (event.payload.session_id !== sessionId) return;
-        const data = event.payload.data;
-        term.write(data);
-        onOutputChunkRef.current?.(data);
-
-        if (!isAgentRef.current) return;
-
-        // OSC 9 (Claude Code "Send notification") → done immediately.
-        // ESC ] 9 ; ... — terminated by BEL (\x07) or ST (ESC \).
-        if (data.includes("\x1b]9;")) {
-          markDone();
-          return;
-        }
-
-        // Any other output means the agent is still producing — (re)arm the
-        // byte-quiet timer so "done" only fires after QUIET_MS of silence.
-        if (getWorkState(sessionId) === "working") {
-          scheduleQuiet();
-        }
-      }
-    );
+    // Two rAFs: first yields to layout, second reads committed dimensions.
+    requestAnimationFrame(() => requestAnimationFrame(fitAndResize));
 
     term.onData((data) => {
       const bytes = Array.from(new TextEncoder().encode(data));
       invoke("write_to_pty", { sessionId, data: bytes }).catch(() => {});
-
-      // Enter (CR) from the user → the agent is now working. Open a dead zone so
-      // the echoed input can't immediately satisfy the byte-quiet "done" check.
-      if (isAgentRef.current && data.includes("\r")) {
-        deadZoneUntil = Date.now() + DEAD_ZONE_MS;
-        setWorkState(sessionId, "working");
-        scheduleQuiet();
-      }
+      // Signal Enter to the Manager so it can arm the work-done timer. Manager
+      // checks isAgent internally — this is a no-op for plain terminal sessions.
+      if (isAgent && data.includes("\r")) sessionManager.markUserInput(sessionId);
     });
 
     const observer = new ResizeObserver(() => {
-      if (!containerRef.current || containerRef.current.offsetWidth === 0) return;
-      fitAddon.fit();
-      invoke("resize_pty", { sessionId, rows: term.rows, cols: term.cols }).catch(() => {});
+      if (el.offsetWidth === 0 || el.offsetHeight === 0) return;
+      if (resizeTimerRef.current !== null) clearTimeout(resizeTimerRef.current);
+      resizeTimerRef.current = setTimeout(fitAndResize, 16);
     });
     observer.observe(el);
 
-    // Intercept Ctrl/Cmd+F before xterm consumes it so we can toggle search.
-    // Return false to suppress xterm's default handling for matched keys.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
-      const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key === "f") {
+      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
         setSearchOpen((o) => !o);
         return false;
       }
@@ -248,15 +158,30 @@ export function TerminalPane({ sessionId, hidden = false, isAgent = false, onAge
     });
 
     return () => {
-      clearQuietTimer();
+      if (resizeTimerRef.current !== null) clearTimeout(resizeTimerRef.current);
+      sessionManager.detach(sessionId, onDataRef.current);
+      webglPool.release(sessionId);
       termRef.current = null;
       fitAddonRef.current = null;
       searchAddonRef.current = null;
       observer.disconnect();
-      unlistenPromise.then((fn) => fn());
       term.dispose();
     };
-  }, [sessionId]);
+  }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Manage WebGL context on show/hide. Releasing on hide returns the context to the
+  // OS pool so other visible panes can use it. Re-acquiring on show ensures the
+  // active pane always gets GPU rendering up to the pool cap (6 contexts).
+  useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    if (hidden) {
+      webglPool.release(sessionId);
+    } else {
+      webglPool.acquire(term, sessionId);
+      requestAnimationFrame(() => requestAnimationFrame(fitIfVisible));
+    }
+  }, [hidden, sessionId]);
 
   function handleSearchChange(q: string) {
     setSearchQuery(q);
@@ -302,4 +227,4 @@ export function TerminalPane({ sessionId, hidden = false, isAgent = false, onAge
       <div ref={containerRef} className="terminal-pane" />
     </div>
   );
-}
+});

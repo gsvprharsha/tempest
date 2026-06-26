@@ -5,18 +5,36 @@ import { useSyncExternalStore } from "react";
 export type WorkState = "idle" | "working" | "done";
 
 const states = new Map<string, WorkState>();
-const listeners = new Set<() => void>();
+// Per-session listeners so a single session's change only re-renders that
+// session's badge, instead of every subscriber (O(N) per chunk, not O(N²)).
+const sessionListeners = new Map<string, Set<() => void>>();
+const versionListeners = new Set<() => void>();
 let version = 0;
 
-function emit() {
+function emit(sessionId: string) {
   version++;
-  for (const fn of listeners) fn();
+  const subs = sessionListeners.get(sessionId);
+  if (subs) for (const fn of subs) fn();
+  for (const fn of versionListeners) fn();
 }
 
-function subscribe(fn: () => void): () => void {
-  listeners.add(fn);
+function subscribeSession(sessionId: string, fn: () => void): () => void {
+  let subs = sessionListeners.get(sessionId);
+  if (!subs) {
+    subs = new Set();
+    sessionListeners.set(sessionId, subs);
+  }
+  subs.add(fn);
   return () => {
-    listeners.delete(fn);
+    subs!.delete(fn);
+    if (subs!.size === 0) sessionListeners.delete(sessionId);
+  };
+}
+
+function subscribeVersion(fn: () => void): () => void {
+  versionListeners.add(fn);
+  return () => {
+    versionListeners.delete(fn);
   };
 }
 
@@ -31,17 +49,17 @@ export function setWorkState(sessionId: string, state: WorkState): void {
   } else {
     states.set(sessionId, state);
   }
-  emit();
+  emit(sessionId);
 }
 
 export function clearWorkState(sessionId: string): void {
-  if (states.delete(sessionId)) emit();
+  if (states.delete(sessionId)) emit(sessionId);
 }
 
 // Subscribe a component to a single session's work state.
 export function useWorkState(sessionId: string): WorkState {
   return useSyncExternalStore(
-    subscribe,
+    (fn) => subscribeSession(sessionId, fn),
     () => getWorkState(sessionId),
     () => getWorkState(sessionId)
   );
@@ -50,5 +68,5 @@ export function useWorkState(sessionId: string): WorkState {
 // Subscribe to any work state change and return an ever-incrementing version.
 // Use in components that need to re-sort or re-count across all sessions.
 export function useWorkStateVersion(): number {
-  return useSyncExternalStore(subscribe, () => version, () => version);
+  return useSyncExternalStore(subscribeVersion, () => version, () => version);
 }

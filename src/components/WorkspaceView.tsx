@@ -1,6 +1,7 @@
-import { useState, useEffect, useRef, type CSSProperties } from "react";
+import { useState, useEffect, useRef, memo, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
+import { sessionManager } from "../store/sessionManager";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createWorktree, gitInit, NotAGitRepoError } from "../lib/worktree";
@@ -30,6 +31,7 @@ import {
   SquareSlash,
   Globe,
   FileCode,
+  Megaphone,
 } from "lucide-react";
 import { useWorkState, setWorkState, clearWorkState } from "../store/workState";
 import { useKeybindings, matchesEvent, formatShortcut } from "../store/keybindings";
@@ -43,6 +45,8 @@ import { CodeMirrorPane } from "./CodeMirrorPane";
 import { RightSidebar } from "./RightSidebar";
 import { NewSessionMenu, NewSessionPlacement, AgentConfig, AGENT_CONFIGS, AgentIcon } from "./NewSessionMenu";
 import { SettingsPanel } from "./SettingsPanel";
+import { BroadcastDialog, BroadcastSession } from "./BroadcastDialog";
+import "./BroadcastDialog.css";
 import { useTheme, builtinThemes } from "../themes/ThemeContext";
 import { Mark } from "../assets/Mark";
 import "./WorkspaceView.css";
@@ -92,20 +96,21 @@ function folderName(p: string): string {
 }
 
 // Right-side work state badge on a tab: spinner while working, dot when done.
-function WorkStateBadge({ sessionId }: { sessionId: string }) {
+// memo: re-renders only when this session's work state changes, not on any parent re-render.
+const WorkStateBadge = memo(function WorkStateBadge({ sessionId }: { sessionId: string }) {
   const state = useWorkState(sessionId);
   if (state === "working") return <Loader size={11} className="spin work-spinner" />;
   if (state === "done") return <span className="work-done-dot" aria-label="Agent finished" />;
   return null;
-}
+});
 
 // Compact work-state indicator for sidebar rows (spinner while working, dot when done).
-function SidebarWorkBadge({ sessionId }: { sessionId: string }) {
+const SidebarWorkBadge = memo(function SidebarWorkBadge({ sessionId }: { sessionId: string }) {
   const state = useWorkState(sessionId);
   if (state === "working") return <Loader size={11} className="spin work-spinner" />;
   if (state === "done") return <span className="work-done-dot" aria-label="Agent finished" />;
   return null;
-}
+});
 
 export function WorkspaceView({ zen, name, path }: Props) {
   const [activeSection, setActiveSection] = useState<NavSection>("overview");
@@ -139,6 +144,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [gitRevision, setGitRevision] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [broadcastOpen, setBroadcastOpen] = useState(false);
 
   // Zen mode: flat worktree list for the single project
   const [zenWorktrees, setZenWorktrees] = useState<Worktree[]>([]);
@@ -150,10 +156,8 @@ export function WorkspaceView({ zen, name, path }: Props) {
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [pendingAgent, setPendingAgent] = useState<AgentConfig | null>(null);
 
-  // Per-session PTY output capture callbacks — used to sniff agent-minted session IDs
-  // (e.g. opencode) from raw output on first spawn. Entries are removed once the ID
-  // is found. Reading the Map in JSX is always fresh because it's a ref, not state.
-  const outputCaptures = useRef<Map<string, (data: string) => void>>(new Map());
+  // (sessionChannels and outputCaptures replaced by SessionManager — it owns all
+  // Channel subscriptions, per-session ring buffers, and capture callbacks.)
 
   // Tracks which cwd paths currently have an openSession call in flight.
   // Prevents duplicate spawns when the restore loop calls openSession for the
@@ -344,6 +348,8 @@ export function WorkspaceView({ zen, name, path }: Props) {
         e.preventDefault();
         const projId = activeSession?.projectId ?? (projects[0]?.id ?? null);
         openSessionMenu({ currentTarget: document.body } as unknown as React.MouseEvent<HTMLElement>, projId, "below");
+      } else if (matchesEvent(keybinds.broadcast, e)) {
+        e.preventDefault(); setBroadcastOpen(true);
       } else if (matchesEvent(keybinds.closeTab, e)) {
         e.preventDefault(); if (activeSessionId) closeSession(activeSessionId);
       } else if (matchesEvent(keybinds.nextTab, e)) {
@@ -402,7 +408,10 @@ export function WorkspaceView({ zen, name, path }: Props) {
     // Close all active sessions belonging to this project
     const projectSessions = sessions.filter((s) => s.projectId === projectId);
     projectSessions.forEach((s) => {
-      if (s.kind !== "diff" && s.kind !== "preview" && s.kind !== "editor") invoke("close_pty_session", { sessionId: s.id }).catch(() => {});
+      if (s.kind !== "diff" && s.kind !== "preview" && s.kind !== "editor") {
+        invoke("close_pty_session", { sessionId: s.id }).catch(() => {});
+        sessionManager.unregister(s.id);
+      }
       clearWorkState(s.id);
     });
     setSessions((prev) => prev.filter((s) => s.projectId !== projectId));
@@ -549,19 +558,6 @@ export function WorkspaceView({ zen, name, path }: Props) {
       // when resuming an existing conversation.
       const args = agent ? buildAgentArgs(agent, sessionId, originalId, prompt) : null;
 
-      await invoke<void>("create_pty_session", {
-        sessionId,
-        cwd,
-        rows: 24,
-        cols: 80,
-        command: agent ?? null,
-        args,
-      });
-
-      // If resuming, conversationId stays as the original UUID. If new, conversationId = the
-      // PTY sessionId which was registered with --session-id.
-      // For capture-based agents (opencode), conversationId starts undefined and is filled
-      // in asynchronously once the ID is found in the PTY output.
       const config = agent ? AGENT_CONFIGS.find((a) => a.hint === agent) : null;
       const usesCapturePattern = !!(config?.capturePattern && config.captureResumeArgs);
       const conversationId = usesCapturePattern && !originalId ? undefined : (originalId ?? sessionId);
@@ -574,17 +570,17 @@ export function WorkspaceView({ zen, name, path }: Props) {
       const storeKey = rootKey ?? (agent ? cwd : undefined);
 
       // Save metadata immediately after the PTY spawns so it survives tab close.
-      // Both agent and plain terminal root sessions are saved (each under its own
-      // unique rootKey); worktree sessions are saved only when they have an agent.
       if (storeKey) {
         saveWorktreeSession(storeKey, { name: sessionName, agent, conversationId, projectId, isRootSession, noGit });
       }
 
-      // For capture-pattern agents on first spawn: register an output listener that
-      // extracts the agent-minted session ID and persists it as conversationId.
+      // Build the optional capture callback for agents that mint their own session ID
+      // from PTY output (e.g. opencode). The callback is registered with the Manager
+      // and removed once the ID is found.
+      let captureOnChunk: ((data: string) => void) | undefined;
       if (agent && config?.capturePattern && config.captureResumeArgs && !originalId) {
         const pattern = config.capturePattern;
-        outputCaptures.current.set(sessionId, (data: string) => {
+        captureOnChunk = (data: string) => {
           const match = pattern.exec(data);
           if (match?.[1]) {
             const capturedId = match[1];
@@ -594,10 +590,32 @@ export function WorkspaceView({ zen, name, path }: Props) {
             setSessions((prev) =>
               prev.map((s) => (s.id === sessionId ? { ...s, conversationId: capturedId } : s))
             );
-            outputCaptures.current.delete(sessionId);
+            sessionManager.setOnChunk(sessionId, null);
           }
-        });
+        };
       }
+
+      const channel = new Channel<{ session_id: string; data: string }>();
+
+      await invoke<void>("create_pty_session", {
+        sessionId,
+        cwd,
+        rows: 24,
+        cols: 80,
+        command: agent ?? null,
+        args,
+        onEvent: channel,
+      });
+
+      // Hand the channel to the Session Manager. It owns the subscription, runs
+      // work-done detection on raw bytes, and maintains the replay buffer.
+      sessionManager.register(
+        sessionId,
+        channel,
+        !!agent,
+        agent ? () => setGitRevision((r) => r + 1) : undefined,
+        captureOnChunk,
+      );
 
       const newSession: Session = {
         id: sessionId,
@@ -856,6 +874,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
       // Use storeKey (not cwd) so a session that was never persisted (e.g. a plain terminal
       // root session sharing cwd with an agent root session) cannot corrupt the agent's entry.
       if (closing?.storeKey) markWorktreeSessionClosed(closing.storeKey);
+      sessionManager.unregister(sessionId);
     }
     clearWorkState(sessionId);
     const remaining = sessions.filter((s) => s.id !== sessionId);
@@ -871,6 +890,17 @@ export function WorkspaceView({ zen, name, path }: Props) {
   function toggleTheme() {
     const next = builtinThemes.find((t) => t.name === (isDark ? "Tempest Light" : "Tempest Dark"));
     if (next) setTheme(next);
+  }
+
+  async function handleBroadcast(message: string, sessionIds: string[]) {
+    const bytes = Array.from(new TextEncoder().encode(message + "\r"));
+    await Promise.all(
+      sessionIds.map((id) => {
+        setWorkState(id, "working");
+        return invoke("write_to_pty", { sessionId: id, data: bytes }).catch(() => {});
+      })
+    );
+    setBroadcastOpen(false);
   }
 
   function openSessionMenu(
@@ -985,6 +1015,14 @@ export function WorkspaceView({ zen, name, path }: Props) {
           onClick={toggleTheme}
         >
           {isDark ? <Sun size={15} /> : <Moon size={15} />}
+        </button>
+        <button
+          className="sub-bar-icon-btn"
+          title="Broadcast to agents (Ctrl+Shift+B)"
+          aria-label="Broadcast to agents"
+          onClick={() => setBroadcastOpen(true)}
+        >
+          <Megaphone size={15} />
         </button>
         {activeSession && (
           <>
@@ -1393,8 +1431,6 @@ export function WorkspaceView({ zen, name, path }: Props) {
                   sessionId={s.id}
                   hidden={s.id !== activeSessionId}
                   isAgent={!!s.agent}
-                  onAgentDone={s.agent ? () => setGitRevision((r) => r + 1) : undefined}
-                  onOutputChunk={outputCaptures.current.get(s.id)}
                 />
               )
             )}
@@ -1802,6 +1838,24 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
 
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+
+      {broadcastOpen && (() => {
+        const agentSessions: BroadcastSession[] = sessions
+          .filter((s) => s.agent && (!s.kind || s.kind === "terminal"))
+          .map((s) => ({
+            id: s.id,
+            name: s.name,
+            agent: s.agent!,
+            projectName: projects.find((p) => p.id === s.projectId)?.name ?? s.projectId,
+          }));
+        return (
+          <BroadcastDialog
+            sessions={agentSessions}
+            onClose={() => setBroadcastOpen(false)}
+            onSend={handleBroadcast}
+          />
+        );
+      })()}
 
     </div>
   );

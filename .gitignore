@@ -26,3 +26,6 @@ src-tauri/target
 *.njsproj
 *.sln
 *.sw?
+.tempest
+.tempest-pid
+.claude
