@@ -109,7 +109,14 @@ fn ensure_tempest_gitignore(project_path: &std::path::Path) {
 
 // Gitignored-but-needed files that git won't carry into a worktree.
 // These are copied (not committed) from the project root into each new worktree.
-const FILES_TO_COPY: &[&str] = &[".env", ".env.local", ".env.development", ".env.production", ".venv", "node_modules"];
+// Only small text files belong here — large dependency dirs are linked instead
+// (see DIRS_TO_LINK) to avoid 30–120s freezes copying tens of thousands of files.
+const FILES_TO_COPY: &[&str] = &[".env", ".env.local", ".env.development", ".env.production"];
+
+// Large dependency directories that are linked (junction on Windows, symlink on
+// Unix) rather than copied. Copying these recursively can be 200–800 MB and tens
+// of thousands of files, which froze the worker thread; a link is instantaneous.
+const DIRS_TO_LINK: &[&str] = &["node_modules", ".venv"];
 
 fn copy_file_or_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     if src.is_dir() {
@@ -187,7 +194,11 @@ fn git_add_remote(repo_path: String, remote_url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn create_terminal_worktree(project_path: String, name: String) -> Result<String, String> {
+async fn create_terminal_worktree(project_path: String, name: String) -> Result<String, String> {
+    // The body is pure blocking work (git subprocesses + file ops). Run it on a
+    // dedicated blocking thread so a slow worktree creation never starves Tauri's
+    // bounded IPC worker pool. Both params are owned, so they move in cleanly.
+    tauri::async_runtime::spawn_blocking(move || {
     let project = std::path::Path::new(&project_path);
     let tempest_dir = project.join(".tempest");
     std::fs::create_dir_all(&tempest_dir).map_err(|e| e.to_string())?;
@@ -308,6 +319,41 @@ fn create_terminal_worktree(project_path: String, name: String) -> Result<String
         }
     }
 
+    // 6b. Link (don't copy) large dependency dirs. A directory junction (Windows)
+    //     or symlink (Unix) is instantaneous and shares one on-disk copy, instead
+    //     of recursively copying hundreds of MB. A failed link must never fail the
+    //     whole worktree creation — log and continue so the agent still gets a
+    //     usable tree (it can re-run install if the dep dir is missing).
+    for dir_to_link in DIRS_TO_LINK {
+        let src = project.join(dir_to_link);
+        if !src.exists() {
+            continue; // not every project has node_modules / .venv
+        }
+        let dest = worktree_path.join(dir_to_link);
+        if dest.exists() {
+            continue; // already present (e.g. tracked) — leave it alone
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Err(e) = junction::create(&src, &dest) {
+                eprintln!(
+                    "Failed to create junction for {}: {} (continuing without it)",
+                    dir_to_link, e
+                );
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Err(e) = std::os::unix::fs::symlink(&src, &dest) {
+                eprintln!(
+                    "Failed to create symlink for {}: {} (continuing without it)",
+                    dir_to_link, e
+                );
+            }
+        }
+    }
+
     // 7. Detect empty worktree and surface a clear error.
     let is_empty = std::fs::read_dir(&worktree_path)
         .map(|mut d| d.all(|e| e.map(|e| e.file_name() == ".git").unwrap_or(false)))
@@ -323,6 +369,9 @@ fn create_terminal_worktree(project_path: String, name: String) -> Result<String
 
     ensure_tempest_gitignore(project);
     Ok(worktree_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 
@@ -719,97 +768,135 @@ fn get_zen_config(
     state.0.lock().unwrap().get(&label).cloned()
 }
 
+/// The resolved interactive shell binary, probed once and cached for the life of
+/// the process. Probing `pwsh` (spawning `pwsh -?`) costs ~100–200ms on Windows,
+/// which previously ran on *every* PTY spawn; caching makes subsequent spawns
+/// instant.
+static SHELL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Probe the platform for the preferred interactive shell. On Windows this checks
+/// whether PowerShell Core (`pwsh`) is available and falls back to the bundled
+/// `powershell.exe`; on Unix it honors `$SHELL` and falls back to `/bin/bash`.
+/// Called at most once per process via `SHELL.get_or_init`.
+fn resolve_shell() -> String {
+    #[cfg(windows)]
+    {
+        if new_command("pwsh").arg("-?").output().is_ok() {
+            "pwsh".to_string()
+        } else {
+            "powershell.exe".to_string()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    }
+}
+
 #[tauri::command]
-fn create_pty_session(
+async fn create_pty_session(
     session_id: String,
     cwd: String,
     rows: u16,
     cols: u16,
     command: Option<String>,
     args: Option<Vec<String>>,
-    state: tauri::State<PtyState>,
+    state: tauri::State<'_, PtyState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let pty_system = native_pty_system();
-    let size = PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    };
-    let pair = pty_system.openpty(size).map_err(|e| e.to_string())?;
+    // Resolve (and cache) the shell once. Cheap if already populated; the first
+    // call performs the ~100–200ms probe so no individual session pays for it twice.
+    SHELL.get_or_init(resolve_shell);
 
-    let cmd = if let Some(ref agent_exe) = command {
-        // Agent session: build the full agent invocation as a string, then run it inside
-        // an interactive shell with -NoExit / exec so the terminal stays alive after exit.
-        // All session/resume flags and the prompt are pre-assembled by the frontend and
-        // arrive in `args` — Rust only shell-quotes and joins them onto the binary name.
-        let mut parts: Vec<String> = vec![agent_exe.clone()];
-        if let Some(ref extra) = args {
-            for arg in extra {
-                if arg.contains(' ') || arg.contains('\'') {
-                    // Single-quote-escape for PowerShell / POSIX sh
-                    parts.push(format!("'{}'", arg.replace('\'', "'''")));
-                } else {
-                    parts.push(arg.clone());
+    // The blocking part — opening the PTY and spawning the shell/agent process —
+    // runs on a dedicated blocking thread so it never starves Tauri's bounded IPC
+    // worker pool. `tauri::State` is not `Send`, so the registry insert happens
+    // back on the async side *after* this completes. All owned params move in.
+    let (session, reader) = tauri::async_runtime::spawn_blocking(move || {
+        let pty_system = native_pty_system();
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pair = pty_system.openpty(size).map_err(|e| e.to_string())?;
+
+        let cmd = if let Some(ref agent_exe) = command {
+            // Agent session: build the full agent invocation as a string, then run it inside
+            // an interactive shell with -NoExit / exec so the terminal stays alive after exit.
+            // All session/resume flags and the prompt are pre-assembled by the frontend and
+            // arrive in `args` — Rust only shell-quotes and joins them onto the binary name.
+            let mut parts: Vec<String> = vec![agent_exe.clone()];
+            if let Some(ref extra) = args {
+                for arg in extra {
+                    if arg.contains(' ') || arg.contains('\'') {
+                        // Single-quote-escape for PowerShell / POSIX sh
+                        parts.push(format!("'{}'", arg.replace('\'', "'''")));
+                    } else {
+                        parts.push(arg.clone());
+                    }
                 }
             }
-        }
-        let agent_invocation = parts.join(" ");
+            let agent_invocation = parts.join(" ");
 
-        #[cfg(windows)]
-        {
-            let shell = if new_command("pwsh").arg("-?").output().is_ok() {
-                "pwsh"
-            } else {
-                "powershell.exe"
-            };
-            let mut c = CommandBuilder::new(shell);
-            c.cwd(&cwd);
-            c.arg("-NoLogo");
-            c.arg("-NoExit");
-            c.arg("-Command");
-            c.arg(agent_invocation);
-            c
-        }
-        #[cfg(not(windows))]
-        {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-            let mut c = CommandBuilder::new(&shell);
-            c.cwd(&cwd);
-            c.arg("-c");
-            c.arg(format!("{}; exec $SHELL -i", agent_invocation));
-            c
-        }
-    } else {
-        // Bare shell session
-        let shell = if cfg!(windows) {
-            if new_command("pwsh").arg("-?").output().is_ok() {
-                "pwsh".to_string()
-            } else {
-                "powershell.exe".to_string()
+            let shell = SHELL.get_or_init(resolve_shell).clone();
+
+            #[cfg(windows)]
+            {
+                let mut c = CommandBuilder::new(&shell);
+                c.cwd(&cwd);
+                c.arg("-NoLogo");
+                c.arg("-NoExit");
+                c.arg("-Command");
+                c.arg(agent_invocation);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let mut c = CommandBuilder::new(&shell);
+                c.cwd(&cwd);
+                c.arg("-c");
+                c.arg(format!("{}; exec $SHELL -i", agent_invocation));
+                c
             }
         } else {
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+            // Bare shell session
+            let shell = SHELL.get_or_init(resolve_shell).clone();
+            let mut c = CommandBuilder::new(&shell);
+            c.cwd(&cwd);
+            c
         };
-        let mut c = CommandBuilder::new(&shell);
-        c.cwd(&cwd);
-        c
-    };
 
-    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
 
-    // Persist the child's OS PID to a sidecar file inside the worktree so the
-    // workspace can still be force-killed after an app restart wipes PtyState.
-    // Fail silently — a missing PID file must never break PTY creation.
-    if let Some(pid) = child.process_id() {
-        let _ = std::fs::write(pid_file_path(&cwd), pid.to_string());
-    }
+        // Persist the child's OS PID to a sidecar file inside the worktree so the
+        // workspace can still be force-killed after an app restart wipes PtyState.
+        // Fail silently — a missing PID file must never break PTY creation.
+        if let Some(pid) = child.process_id() {
+            let _ = std::fs::write(pid_file_path(&cwd), pid.to_string());
+        }
 
-    let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+        let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
+        let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
 
+        Ok::<_, String>((
+            PtySession {
+                writer,
+                master: pair.master,
+                _slave: pair.slave,
+                child,
+                cwd,
+            },
+            reader,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // Pump PTY output to the frontend on a background thread.
     let sid = session_id.clone();
+    let mut reader = reader;
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -830,16 +917,7 @@ fn create_pty_session(
         }
     });
 
-    state.0.lock().unwrap().insert(
-        session_id,
-        PtySession {
-            writer,
-            master: pair.master,
-            _slave: pair.slave,
-            child,
-            cwd,
-        },
-    );
+    state.0.lock().unwrap().insert(session_id, session);
 
     Ok(())
 }
