@@ -490,7 +490,7 @@ fn git_list_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
     }
     let branches = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .filter(|l| l.len() >= 2)
+        .filter(|l| l.len() >= 2 && !l.starts_with("+ "))
         .map(|l| {
             let is_current = l.starts_with("* ");
             let name = l[2..].trim().to_string();
@@ -504,8 +504,48 @@ fn git_list_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
 #[tauri::command]
 fn git_switch_branch(repo_path: String, branch: String) -> Result<(), String> {
     let dir = std::path::Path::new(&repo_path);
+
+    // Get current branch so we can tag the stash to it
+    let head_out = run_git(dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let current_branch = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+
+    // Auto-stash if working tree is dirty
+    let status_out = run_git(dir, &["status", "--porcelain"])?;
+    let is_dirty = !String::from_utf8_lossy(&status_out.stdout).trim().is_empty();
+    if is_dirty {
+        let label = format!("tempest-autostash-from-{}", current_branch);
+        let stash_out = run_git(dir, &["stash", "push", "-u", "-m", &label])?;
+        if !stash_out.status.success() {
+            return Err(git_stderr(&stash_out));
+        }
+    }
+
+    // Switch branch
     let out = run_git(dir, &["checkout", &branch])?;
-    if out.status.success() { Ok(()) } else { Err(git_stderr(&out)) }
+    if !out.status.success() {
+        // Restore stash so the user's changes aren't lost
+        if is_dirty {
+            let _ = run_git(dir, &["stash", "pop"]);
+        }
+        return Err(git_stderr(&out));
+    }
+
+    // If there's an autostash saved from a previous visit to this branch, restore it
+    let stash_list_out = run_git(dir, &["stash", "list"])?;
+    let stash_list = String::from_utf8_lossy(&stash_list_out.stdout).to_string();
+    let restore_label = format!("tempest-autostash-from-{}", branch);
+    for line in stash_list.lines() {
+        if line.contains(&restore_label) {
+            // line format: "stash@{N}: On branch: <msg>"
+            if let Some(idx) = line.split('{').nth(1).and_then(|s| s.split('}').next()) {
+                let stash_ref = format!("stash@{{{}}}", idx);
+                let _ = run_git(dir, &["stash", "pop", &stash_ref]);
+            }
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
