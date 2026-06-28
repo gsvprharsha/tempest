@@ -16,11 +16,10 @@ jobs:
         include:
           - os: windows-latest
             bundles: nsis,msi
-          # Uncomment when macOS/Linux builds are ready:
-          # - os: ubuntu-22.04
-          #   bundles: appimage,deb
-          # - os: macos-latest
-          #   bundles: dmg,app
+          - os: ubuntu-22.04
+            bundles: appimage,deb
+          - os: macos-latest
+            bundles: dmg,app
 
     runs-on: ${{ matrix.os }}
 
@@ -37,6 +36,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> src-tauri/target
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev
 
       - run: npm ci
 
@@ -61,35 +71,33 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Uncomment when Linux build is added to matrix:
-      # - name: Upload Linux artifacts
-      #   if: matrix.os == 'ubuntu-22.04'
-      #   shell: bash
-      #   run: |
-      #     shopt -s nullglob
-      #     files=(
-      #       src-tauri/target/release/bundle/deb/*.deb
-      #       src-tauri/target/release/bundle/appimage/*.AppImage
-      #       src-tauri/target/release/bundle/appimage/*.AppImage.sig
-      #     )
-      #     gh release upload ${{ github.ref_name }} "${files[@]}" --clobber
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload Linux artifacts
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+            src-tauri/target/release/bundle/appimage/*.AppImage.sig
+          )
+          gh release upload ${{ github.ref_name }} "${files[@]}" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Uncomment when macOS build is added to matrix:
-      # - name: Upload macOS artifacts
-      #   if: matrix.os == 'macos-latest'
-      #   shell: bash
-      #   run: |
-      #     shopt -s nullglob
-      #     files=(
-      #       src-tauri/target/release/bundle/dmg/*.dmg
-      #       src-tauri/target/release/bundle/macos/*.app.tar.gz
-      #       src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
-      #     )
-      #     gh release upload ${{ github.ref_name }} "${files[@]}" --clobber
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Upload macOS artifacts
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+          )
+          gh release upload ${{ github.ref_name }} "${files[@]}" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish:
     needs: build
@@ -127,6 +135,20 @@ jobs:
               platforms["windows-x86_64"] = {
                   "signature": sig,
                   "url": f"{base_url}/tempest_{version}_x64-setup.exe"
+              }
+
+          sig = read_sig(f"*{version}*amd64.AppImage.sig")
+          if sig:
+              platforms["linux-x86_64"] = {
+                  "signature": sig,
+                  "url": f"{base_url}/tempest_{version}_amd64.AppImage"
+              }
+
+          sig = read_sig(f"*.app.tar.gz.sig")
+          if sig:
+              platforms["darwin-aarch64"] = {
+                  "signature": sig,
+                  "url": f"{base_url}/tempest.app.tar.gz"
               }
 
           manifest = {
