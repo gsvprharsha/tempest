@@ -1940,7 +1940,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
                 <div
                   key={s.id}
                   className={`pane-slot${isInSplit ? " pane-slot--split" : ""}${isInSplit && s.id === activeSessionId ? " pane-slot--focused" : ""}`}
-                  style={slotStyle}
+                  style={hidden ? { ...slotStyle, pointerEvents: "none" } : slotStyle}
                   onClick={isInSplit ? () => setActiveSessionId(s.id) : undefined}
                 >
                   {isInSplit && (

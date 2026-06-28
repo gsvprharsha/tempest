@@ -147,7 +147,7 @@ export function DiffPane({ cwd, hidden, gitRevision }: Props) {
 
   useEffect(() => {
     if (!hidden) load();
-  }, [cwd, gitRevision]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [cwd, gitRevision, hidden]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Selection ────────────────────────────────────────────────────────────
 
