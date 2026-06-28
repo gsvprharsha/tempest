@@ -8,7 +8,7 @@ import { createWorktree, gitInit, NotAGitRepoError } from "../lib/worktree";
 import { addRecent, getRecents } from "../store/recents";
 import { getOpenProjects, saveOpenProjects } from "../store/openProjects";
 import { getWorktreeSession, saveWorktreeSession, removeWorktreeSession, markWorktreeSessionClosed, markWorktreeSessionOpen, pruneOrphanedSessions, dedupeRootSessions, rootSessionKey, rootSessionIdFromKey, getRootSessionsForProject, type WorktreeSession } from "../store/sessions";
-import { getRuntimeState, setRuntimeState } from "../lib/runtimeState";
+import { getRuntimeState, setRuntimeState, type PersistedTab } from "../lib/runtimeState";
 import {
   LayoutGrid,
   FolderPlus,
@@ -35,6 +35,10 @@ import {
   Megaphone,
   Columns2,
   Rows2,
+  ListOrdered,
+  BookOpen,
+  Copy,
+  Check,
 } from "lucide-react";
 import { useWorkState, setWorkState, clearWorkState } from "../store/workState";
 import { useKeybindings, matchesEvent, formatShortcut } from "../store/keybindings";
@@ -50,6 +54,9 @@ import { NewSessionMenu, NewSessionPlacement, AgentConfig, AGENT_CONFIGS, AgentI
 import { SettingsPanel } from "./SettingsPanel";
 import { BroadcastDialog, BroadcastSession } from "./BroadcastDialog";
 import "./BroadcastDialog.css";
+import { QueuePanel } from "./QueuePanel";
+import { dequeue, useQueue } from "../store/messageQueue";
+import { getPrompts, type PromptEntry } from "../store/prompts";
 import { useTheme, builtinThemes } from "../themes/ThemeContext";
 import { Mark } from "../assets/Mark";
 import "./WorkspaceView.css";
@@ -163,6 +170,21 @@ const WorkStateBadge = memo(function WorkStateBadge({ sessionId }: { sessionId: 
   return null;
 });
 
+// Queue count badge on a tab — re-renders only when this session's queue changes.
+const QueueBadge = memo(function QueueBadge({ sessionId, onClick }: { sessionId: string; onClick: (e: React.MouseEvent) => void }) {
+  const queue = useQueue(sessionId);
+  if (!queue.length) return null;
+  return (
+    <button
+      className="session-tab-queue-badge"
+      onClick={onClick}
+      title={`${queue.length} message${queue.length !== 1 ? "s" : ""} queued`}
+    >
+      {queue.length}
+    </button>
+  );
+});
+
 // Compact work-state indicator for sidebar rows (spinner while working, dot when done).
 const SidebarWorkBadge = memo(function SidebarWorkBadge({ sessionId }: { sessionId: string }) {
   const state = useWorkState(sessionId);
@@ -203,7 +225,13 @@ export function WorkspaceView({ zen, name, path }: Props) {
   const [rightSidebarOpen, setRightSidebarOpen] = useState(true);
   const [gitRevision, setGitRevision] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialSection, setSettingsInitialSection] = useState<string>("appearance");
   const [broadcastOpen, setBroadcastOpen] = useState(false);
+  const [queueOpenSessionId, setQueueOpenSessionId] = useState<string | null>(null);
+  const [promptPickerOpen, setPromptPickerOpen] = useState(false);
+  const [promptPickerItems, setPromptPickerItems] = useState<PromptEntry[]>([]);
+  const [promptSentId, setPromptSentId] = useState<string | null>(null);
+  const promptPickerRef = useRef<HTMLDivElement>(null);
   const [sidebarAtTop, setSidebarAtTop] = useState(true);
   const [sidebarAtBottom, setSidebarAtBottom] = useState(false);
   const sidebarScrollRef = useRef<HTMLDivElement>(null);
@@ -213,6 +241,8 @@ export function WorkspaceView({ zen, name, path }: Props) {
   const [paneLayout, setPaneLayout] = useState<PaneNode | null>(null);
   const paneLayoutRef = useRef<PaneNode | null>(null);
   paneLayoutRef.current = paneLayout; // always current for closure-captured handlers
+  const sessionsRef = useRef<Session[]>([]);
+  sessionsRef.current = sessions; // always current for post-restore active-session lookup
   const workspaceContentRef = useRef<HTMLDivElement>(null);
   const draggingHandle = useRef<{
     splitId: string; dir: SplitDir;
@@ -273,6 +303,19 @@ export function WorkspaceView({ zen, name, path }: Props) {
     );
   }, [projects, zen]);
 
+  // Persist tab-bar order whenever sessions change.
+  useEffect(() => {
+    if (zen) return;
+    setRuntimeState({ sessionOrder: sessions.map((s) => s.instanceId) });
+  }, [sessions, zen]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Persist which session was last focused (by stable instanceId, not ephemeral PTY id).
+  useEffect(() => {
+    if (zen) return;
+    const active = sessions.find((s) => s.id === activeSessionId);
+    setRuntimeState({ activeInstanceId: active?.instanceId ?? null });
+  }, [activeSessionId, sessions, zen]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // On mount: scan every open project for valid worktrees, prune stale session
   // entries that no longer correspond to any path on disk, then restore only
   // the sessions that are still valid. This ensures deleted/removed projects
@@ -281,17 +324,14 @@ export function WorkspaceView({ zen, name, path }: Props) {
     if (zen) return;
 
     async function restoreAll() {
-      // Phase 1 — discover which paths actually exist on disk across all projects
+      // Phase 1 — discover which paths actually exist on disk across all projects.
       const validPaths = new Set<string>();
-      const projectWorktreeMap = new Map<
-        string,
-        { project: Project; wts: { name: string; path: string }[] }
-      >();
+      const allProjectData: { project: Project; wts: { name: string; path: string }[] }[] = [];
 
       for (const project of projects) {
         const wts: { name: string; path: string }[] = [];
         // The project root is always a valid anchor for a persisted root session
-        // (agent root ghosts live only in localStorage keyed by project.path — they
+        // (agent root ghosts live only in sessions store keyed by project.path — they
         // have no disk directory). This MUST be added unconditionally, outside the
         // try below: a project that only ever had root sessions has no .tempest/
         // directory, so list_directory throws and — if this lived inside the try —
@@ -304,7 +344,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
           dedupeRootSessions(project.path);
           setRuntimeState({ migrations: { ...getRuntimeState().migrations, "sessions-v2": true } });
         }
-        // Root sessions (agent + terminal) live only in localStorage under unique
+        // Root sessions (agent + terminal) live only in the sessions store under unique
         // keys (project.path + "::root::" + sessionId) with no disk directory. Mark
         // each as valid so pruneOrphanedSessions doesn't wipe them on restore.
         for (const { key } of getRootSessionsForProject(project.path)) {
@@ -323,58 +363,116 @@ export function WorkspaceView({ zen, name, path }: Props) {
           // .tempest/ doesn't exist or project path is gone
         }
 
-        projectWorktreeMap.set(project.id, { project, wts });
+        allProjectData.push({ project, wts });
         setProjects((prev) =>
           prev.map((p) => (p.id === project.id ? { ...p, worktrees: wts } : p))
         );
       }
 
-      // Phase 2 — remove session entries whose paths no longer exist on disk
+      // Phase 2 — remove session entries whose paths no longer exist on disk.
       pruneOrphanedSessions(validPaths);
 
-      // Phase 3 — restore sessions for the paths that survived pruning
-      for (const { project, wts } of projectWorktreeMap.values()) {
+      // Phase 3 — collect every item to restore into a single sorted list.
+      //
+      // Sessions are opened in saved tab-bar order (sessionOrder) so the tab bar
+      // looks exactly as the user left it. The saved active session is opened last
+      // so the final setActiveSessionId call leaves it focused. Non-terminal tabs
+      // (diff, preview, editor) are included in the same ordered list.
+      const { sessionOrder, activeInstanceId: savedActiveId, tabs: savedTabs } = getRuntimeState();
+      const orderMap = new Map(sessionOrder.map((id, i) => [id, i]));
+
+      type RestoreItem = {
+        instanceId: string;
+        isActive: boolean;
+        sortIndex: number;
+        open: () => Promise<void>;
+      };
+      const items: RestoreItem[] = [];
+
+      for (const { project, wts } of allProjectData) {
+        // Worktree sessions
         for (const wt of wts) {
           const saved = getWorktreeSession(wt.path);
           if (!saved || saved.closed === true) continue;
-          await openSession(
-            saved.name,
-            wt.path,
-            project.id,
-            saved.agent,
-            undefined,
-            undefined,
-            saved.agent ? saved.conversationId : undefined,
-            undefined,
-            undefined,
-            true // dedupe: prevent stale-closure double-spawn in restore loop
-          ).catch(() => {});
+          const instanceId = saved.instanceId ?? wt.path;
+          items.push({
+            instanceId,
+            isActive: instanceId === savedActiveId,
+            sortIndex: orderMap.get(instanceId) ?? Infinity,
+            open: () => openSession(
+              saved.name, wt.path, project.id, saved.agent,
+              undefined, undefined,
+              saved.agent ? saved.conversationId : undefined,
+              undefined, undefined,
+              true // dedupe
+            ).catch(() => {}),
+          });
         }
 
-        // Restore every non-closed root session for this project. Each lives under
-        // its own unique key, so both an agent root and a terminal root can coexist.
+        // Root sessions (agent + plain terminal in project root)
         for (const { key: rootStoreKey, session: rootSaved } of getRootSessionsForProject(project.path)) {
           if (rootSaved.closed === true) continue;
           // Migrate: write instanceId to entries created before this field was introduced.
-          // rootSessionIdFromKey recovers the original PTY id from the key suffix.
           if (!rootSaved.instanceId) {
             const inferredId = rootSessionIdFromKey(rootStoreKey);
             if (inferredId) saveWorktreeSession(rootStoreKey, { ...rootSaved, instanceId: inferredId });
           }
-          await openSession(
-            rootSaved.name,
-            project.path,
-            project.id,
-            rootSaved.agent,
-            undefined,
-            undefined,
-            rootSaved.agent ? rootSaved.conversationId : undefined,
-            true, // isRootSession
-            rootSaved.noGit,
-            true, // dedupe: prevent stale-closure double-spawn in restore loop
-            rootSessionIdFromKey(rootStoreKey) // reuse original PTY id — keeps storeKey stable
-          ).catch(() => {});
+          const instanceId = rootSaved.instanceId ?? rootSessionIdFromKey(rootStoreKey);
+          items.push({
+            instanceId,
+            isActive: instanceId === savedActiveId,
+            sortIndex: orderMap.get(instanceId) ?? Infinity,
+            open: () => openSession(
+              rootSaved.name, project.path, project.id, rootSaved.agent,
+              undefined, undefined,
+              rootSaved.agent ? rootSaved.conversationId : undefined,
+              true, rootSaved.noGit,
+              true, // dedupe
+              rootSessionIdFromKey(rootStoreKey)
+            ).catch(() => {}),
+          });
         }
+      }
+
+      // Non-terminal tabs (diff, preview, editor) — only for projects still open.
+      const openProjectIds = new Set(projects.map((p) => p.id));
+      for (const tab of savedTabs.filter((t) => openProjectIds.has(t.projectId))) {
+        const newId = crypto.randomUUID();
+        items.push({
+          instanceId: tab.instanceId,
+          isActive: tab.instanceId === savedActiveId,
+          sortIndex: orderMap.get(tab.instanceId) ?? Infinity,
+          open: async () => {
+            setSessions((prev) => {
+              if (prev.some((s) => s.instanceId === tab.instanceId)) return prev;
+              return [...prev, {
+                id: newId,
+                instanceId: tab.instanceId,
+                name: tab.name,
+                cwd: tab.cwd,
+                projectId: tab.projectId,
+                kind: tab.kind,
+                previewUrl: tab.previewUrl,
+                createdAt: new Date().toISOString(),
+                metadata: { resumeCount: 0, hasBeenResumed: false },
+              }];
+            });
+            setActiveSessionId(newId);
+          },
+        });
+      }
+
+      // Sort: non-active sessions in saved order, active session unconditionally last
+      // so its setActiveSessionId call wins and it is visually focused on launch.
+      items.sort((a, b) => {
+        if (a.isActive !== b.isActive) return a.isActive ? 1 : -1;
+        if (a.sortIndex !== b.sortIndex) return a.sortIndex - b.sortIndex;
+        return 0;
+      });
+
+      // Phase 4 — open all in order.
+      for (const item of items) {
+        await item.open();
       }
     }
 
@@ -459,6 +557,11 @@ export function WorkspaceView({ zen, name, path }: Props) {
         e.preventDefault(); splitPane("v");
       } else if (matchesEvent(keybinds.splitPaneH, e)) {
         e.preventDefault(); splitPane("h");
+      } else if (matchesEvent(keybinds.openQueue, e)) {
+        e.preventDefault();
+        if (activeSession?.agent) {
+          setQueueOpenSessionId((prev) => prev === activeSession.id ? null : activeSession.id);
+        }
       }
     };
   });
@@ -545,6 +648,9 @@ export function WorkspaceView({ zen, name, path }: Props) {
     setSessions((prev) => prev.filter((s) => s.projectId !== projectId));
     if (projectSessions.some((s) => s.id === activeSessionId)) setActiveSessionId(null);
     setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    // Remove persisted non-terminal tabs for this project.
+    const st = getRuntimeState();
+    setRuntimeState({ tabs: st.tabs.filter((t) => t.projectId !== projectId) });
     setCtxMenu(null);
   }
 
@@ -752,7 +858,15 @@ export function WorkspaceView({ zen, name, path }: Props) {
         sessionId,
         channel,
         !!agent,
-        agent ? () => setGitRevision((r) => r + 1) : undefined,
+        agent ? () => {
+          setGitRevision((r) => r + 1);
+          const item = dequeue(sessionId);
+          if (item) {
+            const bytes = Array.from(new TextEncoder().encode(item.text + "\r"));
+            invoke("write_to_pty", { sessionId, data: bytes }).catch(() => {});
+            sessionManager.markUserInput(sessionId);
+          }
+        } : undefined,
         captureOnChunk,
       );
 
@@ -786,9 +900,12 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
   function openDiffTab(cwd: string, projectId: string) {
     // If a diff tab for this cwd is already open, just focus it.
-    const existing = sessions.find((s) => s.kind === "diff" && s.cwd === cwd);
+    const existing = sessionsRef.current.find((s) => s.kind === "diff" && s.cwd === cwd);
     if (existing) { setActiveSessionId(existing.id); return; }
     const sessionId = crypto.randomUUID();
+    const tab: PersistedTab = { instanceId: sessionId, kind: "diff", projectId, cwd, name: "Diff" };
+    const st = getRuntimeState();
+    setRuntimeState({ tabs: [...st.tabs.filter((t) => !(t.kind === "diff" && t.cwd === cwd)), tab] });
     setSessions((prev) => [...prev, {
       id: sessionId, instanceId: sessionId, name: "Diff", cwd, projectId, kind: "diff",
       createdAt: new Date().toISOString(),
@@ -799,6 +916,9 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
   function openPreviewTab(projectId: string) {
     const sessionId = crypto.randomUUID();
+    const tab: PersistedTab = { instanceId: sessionId, kind: "preview", projectId, cwd: "", name: "Live Preview" };
+    const st = getRuntimeState();
+    setRuntimeState({ tabs: [...st.tabs, tab] });
     setSessions((prev) => [...prev, {
       id: sessionId, instanceId: sessionId, name: "Live Preview", cwd: "", projectId, kind: "preview",
       createdAt: new Date().toISOString(),
@@ -808,10 +928,13 @@ export function WorkspaceView({ zen, name, path }: Props) {
   }
 
   function openEditorTab(filePath: string, projectId: string) {
-    const existing = sessions.find((s) => s.kind === "editor" && s.cwd === filePath);
+    const existing = sessionsRef.current.find((s) => s.kind === "editor" && s.cwd === filePath);
     if (existing) { setActiveSessionId(existing.id); return; }
     const sessionId = crypto.randomUUID();
     const fileName = filePath.replace(/\\/g, "/").split("/").pop() ?? filePath;
+    const tab: PersistedTab = { instanceId: sessionId, kind: "editor", projectId, cwd: filePath, name: fileName };
+    const st = getRuntimeState();
+    setRuntimeState({ tabs: [...st.tabs.filter((t) => !(t.kind === "editor" && t.cwd === filePath)), tab] });
     setSessions((prev) => [...prev, {
       id: sessionId, instanceId: sessionId, name: fileName, cwd: filePath, projectId, kind: "editor",
       createdAt: new Date().toISOString(),
@@ -822,6 +945,12 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
   function updateSessionPreviewUrl(sessionId: string, url: string) {
     setSessions((prev) => prev.map((s) => s.id === sessionId ? { ...s, previewUrl: url } : s));
+    // Persist the updated URL to the tabs slice.
+    const session = sessionsRef.current.find((s) => s.id === sessionId);
+    if (session) {
+      const st = getRuntimeState();
+      setRuntimeState({ tabs: st.tabs.map((t) => t.instanceId === session.instanceId ? { ...t, previewUrl: url } : t) });
+    }
   }
 
   // The path to use for worktree operations (zen uses the prop; default uses the pending project)
@@ -1025,6 +1154,10 @@ export function WorkspaceView({ zen, name, path }: Props) {
         // root session sharing cwd with an agent root session) cannot corrupt the agent's entry.
         if (closing?.storeKey) markWorktreeSessionClosed(closing.storeKey);
         sessionManager.unregister(id);
+      } else if (closing) {
+        // Remove the persisted tab entry for non-terminal tabs.
+        const st = getRuntimeState();
+        setRuntimeState({ tabs: st.tabs.filter((t) => t.instanceId !== closing.instanceId) });
       }
       clearWorkState(id);
     }
@@ -1140,6 +1273,18 @@ export function WorkspaceView({ zen, name, path }: Props) {
       .catch(() => setActiveBranch(null));
   }, [activeSession?.cwd]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  useEffect(() => {
+    if (!promptPickerOpen) return;
+    setPromptPickerItems(getPrompts().filter((p) => p.enabled));
+    function onDown(e: MouseEvent) {
+      if (promptPickerRef.current && !promptPickerRef.current.contains(e.target as Node)) {
+        setPromptPickerOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [promptPickerOpen]);
+
   // Re-check sidebar scroll fades after layout settles (rAF ensures DOM is measured post-paint)
   useEffect(() => { requestAnimationFrame(checkSidebarScroll); }, [projects, sessions]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1244,6 +1389,72 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
         {activeSession && (
           <div className="sub-bar-right">
+            <div className="sub-bar-prompt-wrap" ref={promptPickerRef}>
+              <button
+                className={`sub-bar-icon-btn${promptPickerOpen ? " sub-bar-icon-btn--active" : ""}`}
+                title="Prompt library"
+                aria-label="Prompt library"
+                onClick={() => setPromptPickerOpen((o) => !o)}
+              >
+                <BookOpen size={15} />
+              </button>
+              {promptPickerOpen && (
+                <div className="sub-bar-prompt-picker">
+                  <div className="sub-bar-prompt-picker-header">
+                    <span>Prompts</span>
+                  </div>
+                  <div className="sub-bar-prompt-picker-items">
+                    {promptPickerItems.length > 0 ? (
+                      promptPickerItems.map((p) => {
+                        const sent = promptSentId === p.id;
+                        return (
+                          <button
+                            key={p.id}
+                            className={`sub-bar-prompt-item${sent ? " sub-bar-prompt-item--sent" : ""}`}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              if (sent) return;
+                              navigator.clipboard.writeText(p.body);
+                              setPromptSentId(p.id);
+                              setTimeout(() => {
+                                setPromptPickerOpen(false);
+                                setPromptSentId(null);
+                              }, 800);
+                            }}
+                          >
+                            <span className="sub-bar-prompt-item-icon">
+                              {sent ? <Check size={12} /> : <Copy size={12} />}
+                            </span>
+                            <span className="sub-bar-prompt-item-text">
+                              <span className="sub-bar-prompt-title">{p.title}</span>
+                              <span className="sub-bar-prompt-preview">
+                                {p.body.length > 64 ? p.body.slice(0, 64) + "…" : p.body}
+                              </span>
+                            </span>
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="sub-bar-prompt-empty">No prompts yet</div>
+                    )}
+                  </div>
+                  <div className="sub-bar-prompt-picker-footer">
+                    <button
+                      className="sub-bar-prompt-manage-btn"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setPromptPickerOpen(false);
+                        setSettingsInitialSection("prompts");
+                        setSettingsOpen(true);
+                      }}
+                    >
+                      <Plus size={11} />
+                      <span>Manage prompts</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
             <button
               className="sub-bar-icon-btn"
               title="Toggle right panel"
@@ -1627,6 +1838,15 @@ export function WorkspaceView({ zen, name, path }: Props) {
                       </span>
                     )}
                     {s.agent && <WorkStateBadge sessionId={s.id} />}
+                    {s.agent && (
+                      <QueueBadge
+                        sessionId={s.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setQueueOpenSessionId((prev) => prev === s.id ? null : s.id);
+                        }}
+                      />
+                    )}
                     <span
                       className="session-tab-close"
                       role="button"
@@ -1678,6 +1898,16 @@ export function WorkspaceView({ zen, name, path }: Props) {
                     </button>
                   </>
                 )}
+                {activeSession?.agent && (
+                  <button
+                    className="session-tab-queue-btn"
+                    onClick={() => setQueueOpenSessionId((prev) => prev === activeSession.id ? null : activeSession.id)}
+                    aria-label="Message queue"
+                    title="Message queue (Ctrl+Shift+Q)"
+                  >
+                    <ListOrdered size={13} />
+                  </button>
+                )}
                 <button
                   className="session-tab-broadcast"
                   onClick={() => setBroadcastOpen(true)}
@@ -1721,6 +1951,12 @@ export function WorkspaceView({ zen, name, path }: Props) {
                     >
                       <X size={10} />
                     </button>
+                  )}
+                  {!s.kind && s.agent && !hidden && queueOpenSessionId === s.id && (
+                    <QueuePanel
+                      sessionId={s.id}
+                      onClose={() => setQueueOpenSessionId(null)}
+                    />
                   )}
                   {s.kind === "diff" ? (
                     <DiffPane sessionId={s.id} cwd={s.cwd} hidden={hidden} gitRevision={gitRevision} />
@@ -2195,7 +2431,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
       )}
 
 
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} initialSection={settingsInitialSection as any} />}
 
       {broadcastOpen && (() => {
         const agentSessions: BroadcastSession[] = sessions

@@ -5,6 +5,16 @@ import type { RecentWorkspace } from "../store/recents";
 import type { AppSettings } from "../store/appSettings";
 import type { ActionId, Shortcut } from "../store/keybindings";
 
+// A non-terminal tab (diff, preview, editor) that survives app restarts.
+export interface PersistedTab {
+  instanceId: string;                         // stable UUID minted once when tab is first opened
+  kind: "diff" | "preview" | "editor";
+  projectId: string;
+  cwd: string;                                // worktree path (diff), file path (editor), "" (preview)
+  name: string;
+  previewUrl?: string;
+}
+
 export interface RuntimeState {
   version: number;
   sessions: Record<string, WorktreeSession>;
@@ -14,6 +24,10 @@ export interface RuntimeState {
   keybindings: Partial<Record<ActionId, Shortcut | null>>;
   attribution: boolean;
   migrations: Record<string, boolean>;
+  tabs: PersistedTab[];           // non-terminal tabs (diff, preview, editor)
+  sessionOrder: string[];         // instanceIds in tab-bar order
+  activeInstanceId: string | null; // instanceId of the last focused session
+  prompts: Array<{ id: string; title: string; body: string; enabled: boolean; isBuiltin: boolean }>;
 }
 
 const DEFAULT_STATE: RuntimeState = {
@@ -25,6 +39,10 @@ const DEFAULT_STATE: RuntimeState = {
   keybindings: {},
   attribution: false,
   migrations: {},
+  tabs: [],
+  sessionOrder: [],
+  activeInstanceId: null,
+  prompts: [],
 };
 
 let _state: RuntimeState = { ...DEFAULT_STATE };
@@ -44,26 +62,34 @@ export async function loadRuntimeState(): Promise<void> {
     const raw = await invoke<string>("read_runtime_state");
     const parsed = JSON.parse(raw) as Partial<RuntimeState>;
     _state = {
-      version:      parsed.version      ?? 1,
-      sessions:     parsed.sessions     ?? migrateLS("tempest-worktree-sessions", {}),
-      openProjects: parsed.openProjects ?? migrateLS("tempest-open-projects", []),
-      recents:      parsed.recents      ?? migrateLS("tempest-recents", []),
-      settings:     parsed.settings     ?? migrateLS("tempest-app-settings", {}),
-      keybindings:  parsed.keybindings  ?? migrateLS("tempest-keybindings", {}),
-      attribution:  parsed.attribution  ?? (localStorage.getItem("tempest-attribution") === "true"),
-      migrations:   parsed.migrations   ?? {},
+      version:          parsed.version          ?? 1,
+      sessions:         parsed.sessions         ?? migrateLS("tempest-worktree-sessions", {}),
+      openProjects:     parsed.openProjects     ?? migrateLS("tempest-open-projects", []),
+      recents:          parsed.recents          ?? migrateLS("tempest-recents", []),
+      settings:         parsed.settings         ?? migrateLS("tempest-app-settings", {}),
+      keybindings:      parsed.keybindings      ?? migrateLS("tempest-keybindings", {}),
+      attribution:      parsed.attribution      ?? (localStorage.getItem("tempest-attribution") === "true"),
+      migrations:       parsed.migrations       ?? {},
+      tabs:             parsed.tabs             ?? [],
+      sessionOrder:     parsed.sessionOrder     ?? [],
+      activeInstanceId: parsed.activeInstanceId ?? null,
+      prompts:          parsed.prompts          ?? [],
     };
   } catch {
     // File doesn't exist yet — import whatever is in localStorage.
     _state = {
-      version:      1,
-      sessions:     migrateLS("tempest-worktree-sessions", {}),
-      openProjects: migrateLS("tempest-open-projects", []),
-      recents:      migrateLS("tempest-recents", []),
-      settings:     migrateLS("tempest-app-settings", {}),
-      keybindings:  migrateLS("tempest-keybindings", {}),
-      attribution:  localStorage.getItem("tempest-attribution") === "true",
-      migrations:   {},
+      version:          1,
+      sessions:         migrateLS("tempest-worktree-sessions", {}),
+      openProjects:     migrateLS("tempest-open-projects", []),
+      recents:          migrateLS("tempest-recents", []),
+      settings:         migrateLS("tempest-app-settings", {}),
+      keybindings:      migrateLS("tempest-keybindings", {}),
+      attribution:      localStorage.getItem("tempest-attribution") === "true",
+      migrations:       {},
+      tabs:             [],
+      sessionOrder:     [],
+      activeInstanceId: null,
+      prompts:          [],
     };
   }
   persist();

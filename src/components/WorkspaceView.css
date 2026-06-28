@@ -94,6 +94,144 @@
   flex-shrink: 0;
 }
 
+.sub-bar-icon-btn--active {
+  background: var(--tempest-bg-active);
+  color: var(--tempest-fg-default);
+}
+
+/* ── Sub-bar prompt picker ───────────────────────────────────────────────── */
+
+.sub-bar-prompt-wrap {
+  position: relative;
+}
+
+.sub-bar-prompt-picker {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 280px;
+  display: flex;
+  flex-direction: column;
+  background: var(--tempest-bg-panel);
+  border: 1px solid var(--tempest-border-default);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  z-index: 200;
+}
+
+.sub-bar-prompt-picker-header {
+  flex-shrink: 0;
+  padding: 8px 11px;
+  border-bottom: 1px solid var(--tempest-border-subtle);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--tempest-fg-muted);
+}
+
+.sub-bar-prompt-picker-items {
+  overflow-y: auto;
+  max-height: 200px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tempest-border-subtle) transparent;
+}
+
+.sub-bar-prompt-empty {
+  padding: 14px 11px;
+  font-size: 11px;
+  color: var(--tempest-fg-subtle);
+  text-align: center;
+}
+
+.sub-bar-prompt-picker-footer {
+  flex-shrink: 0;
+  border-top: 1px solid var(--tempest-border-subtle);
+  padding: 6px 8px;
+}
+
+.sub-bar-prompt-manage-btn {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 6px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--tempest-fg-muted);
+  transition: background 80ms, color 80ms;
+}
+
+.sub-bar-prompt-manage-btn:hover {
+  background: var(--tempest-bg-hover);
+  color: var(--tempest-fg-default);
+}
+
+.sub-bar-prompt-item {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 12px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--tempest-border-subtle);
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  transition: background 80ms;
+}
+
+.sub-bar-prompt-item:last-child {
+  border-bottom: none;
+}
+
+.sub-bar-prompt-item:hover {
+  background: var(--tempest-bg-hover);
+}
+
+.sub-bar-prompt-item-icon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  color: var(--tempest-fg-subtle);
+  transition: color 150ms;
+}
+
+.sub-bar-prompt-item--sent .sub-bar-prompt-item-icon {
+  color: var(--tempest-accent-green, #58c760);
+}
+
+.sub-bar-prompt-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.sub-bar-prompt-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tempest-fg-default);
+}
+
+.sub-bar-prompt-preview {
+  font-size: 10.5px;
+  color: var(--tempest-fg-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .sub-bar-vdivider {
   width: 1px;
   height: 16px;
@@ -876,7 +1014,8 @@
 
 .session-tab-add,
 .session-tab-broadcast,
-.session-tab-split-btn {
+.session-tab-split-btn,
+.session-tab-queue-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -904,9 +1043,38 @@
 
 .session-tab-add:hover,
 .session-tab-broadcast:hover,
-.session-tab-split-btn:hover {
+.session-tab-split-btn:hover,
+.session-tab-queue-btn:hover {
   background: var(--tempest-bg-hover);
   color: var(--tempest-fg-default);
+}
+
+.session-tab-queue-btn {
+  border-left: 1px solid var(--tempest-border-default);
+}
+
+/* Queue count badge on agent tabs */
+.session-tab-queue-badge {
+  background: var(--tempest-accent-blue);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 600;
+  font-family: "Geist Mono", monospace;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+  transition: filter 100ms;
+}
+.session-tab-queue-badge:hover {
+  filter: brightness(1.15);
 }
 
 /* Workspace content */

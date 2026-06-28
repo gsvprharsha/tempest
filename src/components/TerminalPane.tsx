@@ -228,6 +228,22 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, hidden = fal
     }
   }, [hidden, sessionId]);
 
+  // Repaint after minimize/restore. WebView2 may drop the rendered content when the
+  // window is minimized; when focus returns, force xterm to redraw all visible rows.
+  useEffect(() => {
+    const onFocus = () => {
+      const term = termRef.current;
+      if (!term || hidden) return;
+      webglPool.acquire(term, sessionId);
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        fitIfVisible();
+        termRef.current?.refresh(0, (termRef.current?.rows ?? 1) - 1);
+      }));
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [sessionId, hidden]);
+
   function handleSearchChange(q: string) {
     setSearchQuery(q);
     if (q) searchAddonRef.current?.findNext(q, { incremental: true });

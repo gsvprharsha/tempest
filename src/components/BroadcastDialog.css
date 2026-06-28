@@ -9,7 +9,7 @@
 }
 
 .bc-dialog {
-  background: var(--tempest-bg-active);
+  background: var(--tempest-bg-panel);
   border: 1px solid var(--tempest-border-subtle);
   border-radius: 8px;
   width: 420px;

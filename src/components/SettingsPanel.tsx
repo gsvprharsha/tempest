@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { X, Palette, Keyboard, Info, RotateCcw, GitCommitHorizontal, Terminal as TerminalIcon, GitBranch } from "lucide-react";
+import { X, Palette, Keyboard, Info, RotateCcw, GitCommitHorizontal, Terminal as TerminalIcon, GitBranch, BookOpen, GripVertical, Pencil, Copy, Trash2, Plus } from "lucide-react";
 import { useTheme } from "../themes/ThemeContext";
 import type { Theme } from "../themes/types";
 import {
@@ -17,17 +17,29 @@ import {
 } from "../store/keybindings";
 import { useAttribution, setAttribution } from "../store/attribution";
 import { useSettings, updateSetting, FONT_FAMILY_OPTIONS, type AppSettings } from "../store/appSettings";
+import {
+  usePrompts,
+  updatePrompt,
+  deletePrompt,
+  resetPrompt,
+  clonePrompt,
+  addPrompt,
+  reorderPrompts,
+  isBuiltinModified,
+  type PromptEntry,
+} from "../store/prompts";
 import "./SettingsPanel.css";
+
+type Section = "appearance" | "terminal" | "git" | "prompts" | "keyboard" | "attribution" | "about";
 
 interface SettingsPanelProps {
   onClose: () => void;
   onAttributionToggle?: (enabled: boolean) => void;
+  initialSection?: Section;
 }
 
-type Section = "appearance" | "terminal" | "git" | "keyboard" | "attribution" | "about";
-
-export function SettingsPanel({ onClose, onAttributionToggle }: SettingsPanelProps) {
-  const [activeSection, setActiveSection] = useState<Section>("appearance");
+export function SettingsPanel({ onClose, onAttributionToggle, initialSection }: SettingsPanelProps) {
+  const [activeSection, setActiveSection] = useState<Section>(initialSection ?? "appearance");
   const { theme, themes, setTheme } = useTheme();
 
   useEffect(() => {
@@ -74,6 +86,13 @@ export function SettingsPanel({ onClose, onAttributionToggle }: SettingsPanelPro
               Git
             </button>
             <button
+              className={`sp-nav-item${activeSection === "prompts" ? " sp-nav-item--active" : ""}`}
+              onClick={() => setActiveSection("prompts")}
+            >
+              <BookOpen size={14} />
+              Prompts
+            </button>
+            <button
               className={`sp-nav-item${activeSection === "keyboard" ? " sp-nav-item--active" : ""}`}
               onClick={() => setActiveSection("keyboard")}
             >
@@ -103,6 +122,7 @@ export function SettingsPanel({ onClose, onAttributionToggle }: SettingsPanelPro
             )}
             {activeSection === "terminal" && <TerminalSection />}
             {activeSection === "git" && <GitSection />}
+            {activeSection === "prompts" && <PromptsSection />}
             {activeSection === "keyboard" && <KeyboardSection />}
             {activeSection === "attribution" && <AttributionSection onToggle={onAttributionToggle} />}
             {activeSection === "about" && <AboutSection />}
@@ -322,6 +342,247 @@ function GitSection() {
             onChange={(e) => updateSetting("commitMessageTemplate", e.target.value)}
           />
         </SettingRow>
+      </div>
+    </div>
+  );
+}
+
+/* ── Prompts ─────────────────────────────────────────────────────────────── */
+
+function PromptsSection() {
+  const prompts = usePrompts();
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editBody, setEditBody] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newBody, setNewBody] = useState("");
+
+  const dragIdRef = useRef<string | null>(null);
+  const dropIdRef = useRef<string | null>(null);
+  const dropSideRef = useRef<"before" | "after">("before");
+  const [dropIndicator, setDropIndicator] = useState<{ id: string; side: "before" | "after" } | null>(null);
+
+  function startEdit(p: PromptEntry) {
+    setAdding(false);
+    setEditingId(p.id);
+    setEditTitle(p.title);
+    setEditBody(p.body);
+  }
+
+  function saveEdit() {
+    if (!editingId) return;
+    updatePrompt(editingId, { title: editTitle.trim() || "Untitled", body: editBody });
+    setEditingId(null);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+  }
+
+  function submitNew() {
+    const t = newTitle.trim();
+    const b = newBody.trim();
+    if (!t || !b) return;
+    addPrompt(t, b);
+    setNewTitle("");
+    setNewBody("");
+    setAdding(false);
+  }
+
+  function cancelNew() {
+    setNewTitle("");
+    setNewBody("");
+    setAdding(false);
+  }
+
+  return (
+    <div className="sp-section">
+      <div className="sp-prompts-header">
+        <div>
+          <div className="sp-section-heading">Prompt Library</div>
+          <p className="sp-section-desc" style={{ marginBottom: 0 }}>
+            Saved prompts you can insert into the message queue with one click.
+          </p>
+        </div>
+        {!adding && (
+          <button
+            className="sp-prompts-new-btn"
+            onClick={() => { setEditingId(null); setAdding(true); }}
+          >
+            <Plus size={12} />
+            New
+          </button>
+        )}
+      </div>
+
+      {adding && (
+        <div className="sp-prompt-form sp-prompt-form--standalone">
+          <input
+            className="sp-prompt-form-title"
+            type="text"
+            placeholder="Prompt title"
+            value={newTitle}
+            onChange={(e) => setNewTitle(e.target.value)}
+            autoFocus
+          />
+          <textarea
+            className="sp-prompt-form-body"
+            placeholder="Prompt text sent to the agent…"
+            rows={4}
+            value={newBody}
+            onChange={(e) => setNewBody(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); submitNew(); }
+              if (e.key === "Escape") { e.preventDefault(); cancelNew(); }
+              e.stopPropagation();
+            }}
+          />
+          <div className="sp-prompt-form-actions">
+            <button
+              className="sp-prompt-form-btn sp-prompt-form-btn--primary"
+              onClick={submitNew}
+              disabled={!newTitle.trim() || !newBody.trim()}
+            >
+              Add
+            </button>
+            <button className="sp-prompt-form-btn" onClick={cancelNew}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      <div className="sp-prompt-list">
+        {prompts.map((p) => {
+          const modified = isBuiltinModified(p);
+          const isEditing = editingId === p.id;
+          const isDragOver = dropIndicator?.id === p.id;
+
+          return (
+            <div
+              key={p.id}
+              className={[
+                "sp-prompt-item",
+                !p.enabled && "sp-prompt-item--disabled",
+                isDragOver && dropIndicator?.side === "before" && "sp-prompt-item--drop-before",
+                isDragOver && dropIndicator?.side === "after"  && "sp-prompt-item--drop-after",
+              ].filter(Boolean).join(" ")}
+              draggable={!isEditing}
+              onDragStart={(e) => {
+                dragIdRef.current = p.id;
+                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.setData("text/plain", p.id);
+              }}
+              onDragEnd={() => {
+                dragIdRef.current = null;
+                dropIdRef.current = null;
+                setDropIndicator(null);
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (!dragIdRef.current || dragIdRef.current === p.id) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const side: "before" | "after" = e.clientY < rect.top + rect.height / 2 ? "before" : "after";
+                dropIdRef.current = p.id;
+                dropSideRef.current = side;
+                setDropIndicator({ id: p.id, side });
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const from = dragIdRef.current;
+                const to = dropIdRef.current;
+                const side = dropSideRef.current;
+                if (from && to && from !== to) reorderPrompts(from, to, side);
+                dragIdRef.current = null;
+                dropIdRef.current = null;
+                setDropIndicator(null);
+              }}
+            >
+              {isEditing ? (
+                <div className="sp-prompt-form">
+                  <input
+                    className="sp-prompt-form-title"
+                    type="text"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    autoFocus
+                  />
+                  <textarea
+                    className="sp-prompt-form-body"
+                    rows={4}
+                    value={editBody}
+                    onChange={(e) => setEditBody(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); saveEdit(); }
+                      if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+                      e.stopPropagation();
+                    }}
+                  />
+                  <div className="sp-prompt-form-actions">
+                    <button className="sp-prompt-form-btn sp-prompt-form-btn--primary" onClick={saveEdit}>
+                      Save
+                    </button>
+                    <button className="sp-prompt-form-btn" onClick={cancelEdit}>Cancel</button>
+                    {p.isBuiltin && modified && (
+                      <button
+                        className="sp-prompt-form-btn sp-prompt-form-btn--reset"
+                        onClick={() => { resetPrompt(p.id); setEditingId(null); }}
+                      >
+                        <RotateCcw size={11} />
+                        Reset to default
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="sp-prompt-row">
+                  <span className="sp-prompt-grip" aria-hidden>
+                    <GripVertical size={13} />
+                  </span>
+                  <ToggleSwitch
+                    on={p.enabled}
+                    onChange={(v) => updatePrompt(p.id, { enabled: v })}
+                  />
+                  <div className="sp-prompt-info">
+                    <div className="sp-prompt-title-row">
+                      <span className="sp-prompt-title">{p.title}</span>
+                      {p.isBuiltin && <span className="sp-prompt-badge">built-in</span>}
+                      {modified && <span className="sp-prompt-badge sp-prompt-badge--modified">modified</span>}
+                    </div>
+                    <span className="sp-prompt-preview">
+                      {p.body.length > 72 ? p.body.slice(0, 72) + "…" : p.body}
+                    </span>
+                  </div>
+                  <div className="sp-prompt-actions">
+                    <button className="sp-prompt-action-btn" title="Edit" onClick={() => startEdit(p)}>
+                      <Pencil size={12} />
+                    </button>
+                    <button className="sp-prompt-action-btn" title="Clone" onClick={() => clonePrompt(p.id)}>
+                      <Copy size={12} />
+                    </button>
+                    {p.isBuiltin && modified && (
+                      <button
+                        className="sp-prompt-action-btn"
+                        title="Reset to default"
+                        onClick={() => resetPrompt(p.id)}
+                      >
+                        <RotateCcw size={12} />
+                      </button>
+                    )}
+                    {!p.isBuiltin && (
+                      <button
+                        className="sp-prompt-action-btn sp-prompt-action-btn--danger"
+                        title="Delete"
+                        onClick={() => deletePrompt(p.id)}
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </div>
   );

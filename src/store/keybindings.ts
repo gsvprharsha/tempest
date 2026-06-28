@@ -13,7 +13,8 @@ export type ActionId =
   | "prevTab"
   | "broadcast"
   | "splitPaneV"
-  | "splitPaneH";
+  | "splitPaneH"
+  | "openQueue";
 
 export interface Shortcut {
   key: string;   // KeyboardEvent.key (original casing preserved)
@@ -41,6 +42,7 @@ export const ACTION_DEFS: ActionDef[] = [
   { id: "broadcast",          label: "Broadcast to Agents",    group: "Workspaces"  },
   { id: "splitPaneV",         label: "Split Pane Side by Side", group: "Layout"      },
   { id: "splitPaneH",         label: "Split Pane Top / Bottom", group: "Layout"      },
+  { id: "openQueue",          label: "Open Message Queue",      group: "Workspaces"  },
 ];
 
 export const DEFAULTS: Record<ActionId, Shortcut | null> = {
@@ -56,6 +58,7 @@ export const DEFAULTS: Record<ActionId, Shortcut | null> = {
   broadcast:          { key: "m",   ctrl: true,  shift: true,  alt: false },
   splitPaneV:         { key: "|",   ctrl: true,  shift: true,  alt: false },
   splitPaneH:         { key: "_",   ctrl: true,  shift: true,  alt: false },
+  openQueue:          { key: "q",   ctrl: true,  shift: true,  alt: false },
 };
 
 const listeners = new Set<() => void>();
