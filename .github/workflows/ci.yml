@@ -49,6 +49,9 @@ jobs:
             patchelf \
             libxdo-dev
 
+      - name: Stub atlas bundle for cargo check
+        run: mkdir -p src-tauri/resources/atlas
+
       - name: Check
         working-directory: src-tauri
         run: cargo check
