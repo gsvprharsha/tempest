@@ -1,4 +1,4 @@
-import { cpSync, rmSync, mkdirSync, existsSync } from 'fs'
+import { cpSync, rmSync, mkdirSync, existsSync, writeFileSync } from 'fs'
 import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -7,6 +7,20 @@ const dest = join(root, 'src-tauri', 'resources', 'atlas')
 
 rmSync(dest, { recursive: true, force: true })
 mkdirSync(dest, { recursive: true })
+
+// Mark the bundle as CommonJS. The compiled atlas dist/ is CJS (exports/require),
+// but ships without a package.json. Node infers a .js file's module type from the
+// NEAREST package.json walking up the tree — and in a dev worktree the nearest
+// ancestor is the app's own package.json, which declares "type": "module". That
+// makes node load server-entry.js as ESM and crash at load with
+// `ReferenceError: exports is not defined in ES module scope`, BEFORE main() runs
+// — so no logs, no atlas.db, and the spawn looks like an indefinite hang. A
+// package.json here pins the bundle to CommonJS regardless of any ancestor.
+writeFileSync(
+  join(dest, 'package.json'),
+  JSON.stringify({ name: '@tempest/atlas-bundle', private: true, type: 'commonjs', main: 'dist/index.js' }, null, 2) + '\n'
+)
+console.log('  Wrote package.json (type: commonjs)')
 
 // Copy compiled atlas dist.
 cpSync(join(root, 'packages', 'atlas', 'dist'), join(dest, 'dist'), { recursive: true })

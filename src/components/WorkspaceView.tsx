@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, memo, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { sessionManager } from "../store/sessionManager";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -40,6 +41,7 @@ import {
   Copy,
   Check,
   Cpu,
+  Database,
 } from "lucide-react";
 import { useWorkState, setWorkState, clearWorkState } from "../store/workState";
 import { useKeybindings, matchesEvent, formatShortcut } from "../store/keybindings";
@@ -300,6 +302,14 @@ export function WorkspaceView({ zen, name, path }: Props) {
     loading: boolean;
     error: string | null;
   } | null>(null);
+
+  // Stream Atlas indexer output to the browser DevTools console
+  useEffect(() => {
+    const p = listen<{ path: string; line: string }>("atlas:log", (e) => {
+      console.log(`[Atlas] ${e.payload.line}`);
+    });
+    return () => { p.then((fn) => fn()); };
+  }, []);
 
   // Persist projects list to localStorage whenever it changes
   useEffect(() => {
@@ -848,19 +858,6 @@ export function WorkspaceView({ zen, name, path }: Props) {
 
       const channel = new Channel<{ session_id: string; data: string }>();
 
-      // Resolve the project's root path for Atlas MCP injection. Worktree sessions
-      // use a cwd inside the worktree, not the original project root, so we look up
-      // the path from the project registry rather than relying on cwd.
-      const projectRootPath = getOpenProjects().find((p) => p.id === projectId)?.path ?? null;
-      const atlasProjectPath =
-        agent &&
-        config?.mcpSupported &&
-        getSettings().atlasEnabled &&
-        projectRootPath &&
-        getRuntimeState().atlasProjects[projectRootPath] === true
-          ? projectRootPath
-          : null;
-
       await invoke<void>("create_pty_session", {
         sessionId,
         cwd,
@@ -868,7 +865,6 @@ export function WorkspaceView({ zen, name, path }: Props) {
         cols: 80,
         command: agent ?? null,
         args,
-        atlasProjectPath,
         onEvent: channel,
       });
 
@@ -1368,7 +1364,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
       if (atlasSettings.atlasAutoIndex) {
         if (decided[selected] === undefined) {
           setRuntimeState({ atlasProjects: { ...decided, [selected]: true } });
-          invoke("start_atlas_index", { projectPath: selected }).catch(() => {});
+          invoke("start_atlas_index", { projectPath: selected }).catch((e) => console.error("[Atlas] start_atlas_index failed:", e));
           setAtlasIndexingPaths((prev) => prev.includes(selected) ? prev : [...prev, selected]);
         }
       } else if (decided[selected] === undefined) {
@@ -2209,6 +2205,26 @@ export function WorkspaceView({ zen, name, path }: Props) {
                 Delete workspace
               </button>
             )}
+            {ctxMenu.isProjectHeader && getSettings().atlasEnabled && (
+              <button
+                className="ctx-item"
+                onClick={() => {
+                  const decided = getRuntimeState().atlasProjects ?? {};
+                  setRuntimeState({ atlasProjects: { ...decided, [ctxMenu.projectPath]: true } });
+                  invoke("start_atlas_index", { projectPath: ctxMenu.projectPath })
+                    .catch((e) => console.error("[Atlas] start_atlas_index failed:", e));
+                  setAtlasIndexingPaths((prev) =>
+                    prev.includes(ctxMenu.projectPath) ? prev : [...prev, ctxMenu.projectPath]
+                  );
+                  setCtxMenu(null);
+                }}
+              >
+                <Database size={13} />
+                {(getRuntimeState().atlasProjects ?? {})[ctxMenu.projectPath] === true
+                  ? "Re-index project"
+                  : "Index project"}
+              </button>
+            )}
             {ctxMenu.isProjectHeader && (
               <button
                 className="ctx-item ctx-item--danger"
@@ -2506,7 +2522,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
                   if (atlasAutoIndexLocal) {
                     updateSetting("atlasAutoIndex", true);
                   }
-                  invoke("start_atlas_index", { projectPath: atlasPromptPath }).catch(() => {});
+                  invoke("start_atlas_index", { projectPath: atlasPromptPath }).catch((e) => console.error("[Atlas] start_atlas_index failed:", e));
                   setAtlasIndexingPaths((prev) => prev.includes(atlasPromptPath) ? prev : [...prev, atlasPromptPath]);
                   setAtlasPromptPath(null);
                 }}

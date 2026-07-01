@@ -234,7 +234,12 @@ export class Atlas {
    * @returns A new Atlas instance
    */
   static async init(projectRoot: string, options: InitOptions = {}): Promise<Atlas> {
+    process.stderr.write(`[Atlas] Atlas.init() start — ${projectRoot}\n`);
+
+    process.stderr.write('[Atlas] step 1/5: initGrammars()\n');
     await initGrammars();
+    process.stderr.write('[Atlas] step 1/5: done\n');
+
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if already initialized
@@ -242,21 +247,30 @@ export class Atlas {
       throw new Error(`Atlas already initialized in ${resolvedRoot}`);
     }
 
+    process.stderr.write('[Atlas] step 2/5: createDirectory()\n');
     // Create directory structure
     createDirectory(resolvedRoot);
+    process.stderr.write('[Atlas] step 2/5: done\n');
 
+    process.stderr.write('[Atlas] step 3/5: DatabaseConnection.initialize()\n');
     // Initialize database
     const dbPath = getDatabasePath(resolvedRoot);
     const db = DatabaseConnection.initialize(dbPath);
-    const queries = new QueryBuilder(db.getDb());
+    process.stderr.write('[Atlas] step 3/5: done\n');
 
+    process.stderr.write('[Atlas] step 4/5: QueryBuilder()\n');
+    const queries = new QueryBuilder(db.getDb());
     const instance = new Atlas(db, queries, resolvedRoot);
+    process.stderr.write('[Atlas] step 4/5: done\n');
 
     // Run initial indexing if requested
     if (options.index) {
+      process.stderr.write('[Atlas] step 5/5: indexAll() starting\n');
       await instance.indexAll({ onProgress: options.onProgress });
+      process.stderr.write('[Atlas] step 5/5: indexAll() done\n');
     }
 
+    process.stderr.write('[Atlas] Atlas.init() complete\n');
     return instance;
   }
 

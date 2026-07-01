@@ -176,7 +176,9 @@ let parserInitialized = false;
 export async function initGrammars(): Promise<void> {
   if (parserInitialized) return;
 
+  process.stderr.write('[Atlas] Parser.init() starting\n');
   await Parser.init();
+  process.stderr.write('[Atlas] Parser.init() done\n');
 
   parserInitialized = true;
 }
