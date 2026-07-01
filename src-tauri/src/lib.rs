@@ -85,6 +85,15 @@ fn start_atlas_index(app: tauri::AppHandle, project_path: String) -> Result<(), 
 }
 
 #[tauri::command]
+fn check_atlas_db(project_path: String) -> bool {
+    std::path::Path::new(&project_path)
+        .join(".tempest")
+        .join("atlas")
+        .join("atlas.db")
+        .exists()
+}
+
+#[tauri::command]
 fn read_runtime_state(app: tauri::AppHandle) -> Result<String, String> {
     use tauri::Manager;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
@@ -1644,6 +1653,7 @@ pub fn run() {
             read_runtime_state,
             write_runtime_state,
             start_atlas_index,
+            check_atlas_db,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

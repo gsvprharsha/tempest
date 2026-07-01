@@ -60,6 +60,8 @@ import { dequeue, useQueue } from "../store/messageQueue";
 import { getPrompts, type PromptEntry } from "../store/prompts";
 import { useTheme, builtinThemes } from "../themes/ThemeContext";
 import { Mark } from "../assets/Mark";
+import { AtlasIndexToast } from "./AtlasIndexToast";
+import "./AtlasIndexToast.css";
 import "./WorkspaceView.css";
 
 interface Props {
@@ -230,6 +232,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
   const [broadcastOpen, setBroadcastOpen] = useState(false);
   const [atlasPromptPath, setAtlasPromptPath] = useState<string | null>(null);
   const [atlasAutoIndexLocal, setAtlasAutoIndexLocal] = useState(false);
+  const [atlasIndexingPaths, setAtlasIndexingPaths] = useState<string[]>([]);
   const [queueOpenSessionId, setQueueOpenSessionId] = useState<string | null>(null);
   const [promptPickerOpen, setPromptPickerOpen] = useState(false);
   const [promptPickerItems, setPromptPickerItems] = useState<PromptEntry[]>([]);
@@ -1366,6 +1369,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
         if (decided[selected] === undefined) {
           setRuntimeState({ atlasProjects: { ...decided, [selected]: true } });
           invoke("start_atlas_index", { projectPath: selected }).catch(() => {});
+          setAtlasIndexingPaths((prev) => prev.includes(selected) ? prev : [...prev, selected]);
         }
       } else if (decided[selected] === undefined) {
         setAtlasAutoIndexLocal(false);
@@ -2503,6 +2507,7 @@ export function WorkspaceView({ zen, name, path }: Props) {
                     updateSetting("atlasAutoIndex", true);
                   }
                   invoke("start_atlas_index", { projectPath: atlasPromptPath }).catch(() => {});
+                  setAtlasIndexingPaths((prev) => prev.includes(atlasPromptPath) ? prev : [...prev, atlasPromptPath]);
                   setAtlasPromptPath(null);
                 }}
               >
@@ -2531,6 +2536,20 @@ export function WorkspaceView({ zen, name, path }: Props) {
           />
         );
       })()}
+
+      {atlasIndexingPaths.length > 0 && createPortal(
+        <div className="atlas-toast-container">
+          {atlasIndexingPaths.map((p) => (
+            <AtlasIndexToast
+              key={p}
+              projectPath={p}
+              projectName={folderName(p)}
+              onDismiss={() => setAtlasIndexingPaths((prev) => prev.filter((x) => x !== p))}
+            />
+          ))}
+        </div>,
+        document.body
+      )}
 
     </div>
   );
